@@ -1,0 +1,179 @@
+# samling
+
+Shuffle your way through an Instapaper backlog.
+
+`samling` keeps a local mirror of your unread list, picks articles out of it at
+random, opens them in your browser, and archives what you've read on the next
+sync. It exists because a reading list is ordered and the top of it goes stale,
+so a large backlog just sits there getting larger.
+
+It's a port of the idea behind [pickpocket][] — a Pocket CLI that died with
+Pocket in July 2025 — to Instapaper, with the destructive parts removed.
+
+[pickpocket]: https://github.com/tiagoamaro/pickpocket-rust
+
+```
+$ samling status
+1,847 unread
+0 pending archive
+312 archived
+
+Last synced 2 hours ago
+Oldest unread is 4 years old: The Cathedral and the Bazaar
+
+Top domains:
+    204  nytimes.com
+    118  theatlantic.com
+     97  longreads.com
+
+$ samling pick -n 3
+ 1. A Brief History of the Interrobang
+    https://www.theatlantic.com/…
+    theatlantic.com · saved 2 years ago
+ 2. …
+```
+
+## How it works
+
+Picking is **entirely offline**. `samling pick` reads a JSON file, chooses at
+random, and shells out to your browser — no network, no latency, works on a
+plane. Everything that touches Instapaper happens in one explicit `samling sync`.
+
+Picked articles are **archived, never deleted**. They stay in your account and
+stay searchable. A tombstone list makes sure an article is never served up
+twice, even if a later sync still reports it as unread.
+
+## Install
+
+```sh
+go install github.com/molson/samling@latest
+```
+
+Or build from a checkout: `go build -o samling .`
+
+## Setup
+
+1. **Get an API key.** Instapaper's Full API needs a consumer token, and every
+   request is reviewed by a human. Apply at
+   <https://www.instapaper.com/developers/applications/create>.
+
+2. **Give it to samling**, either in `~/.samling/config.json`:
+
+   ```json
+   { "consumer_key": "…", "consumer_secret": "…" }
+   ```
+
+   or via `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`, which take
+   precedence.
+
+3. **Log in and sync.**
+
+   ```sh
+   samling login    # prompts for your Instapaper username and password
+   samling sync     # pulls your unread list down
+   samling pick -n 3
+   ```
+
+Instapaper's API only supports xAuth, so `login` trades your username and
+password for a long-lived token in a single call. The password is used once and
+never written to disk; only the resulting token is stored.
+
+## Commands
+
+| | |
+|---|---|
+| `samling login` | Exchange username + password for an access token |
+| `samling sync` | Archive what you've read, then refresh the local mirror |
+| `samling pick` | Open N random unread articles, mark them read locally |
+| `samling list` | Same selection as `pick`, printed instead of opened |
+| `samling status` | Unread / pending / archived counts, top domains, oldest article |
+| `samling undo` | Put the most recent pick back (before the next sync) |
+| `samling folders` | List your Instapaper folder ids |
+
+### Filters
+
+`pick` and `list` take the same filters:
+
+```sh
+samling pick -n 5 --older-than 1y          # dig into the deep backlog
+samling pick --domain nytimes.com          # matches subdomains too
+samling pick --newer-than 7d               # only things saved this week
+samling pick --starred                     # or --unstarred
+samling list -n 10 --seed 42               # reproducible shuffle
+samling pick --folder 1234567              # a folder id from `samling folders`
+```
+
+Spans accept `d`, `w` and `y` on top of Go's duration syntax: `90d`, `2w`,
+`1y`, `36h`, `30m`.
+
+### Undo
+
+`pick` commits its state change before opening anything, so an interrupted run
+can't serve the same article twice. If you didn't mean it:
+
+```sh
+samling undo
+```
+
+That only works before the next `sync`. Once an article has actually been
+archived in Instapaper, unarchive it there.
+
+## Files
+
+Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
+
+| file | |
+|---|---|
+| `config.json` | Your consumer key and secret |
+| `token.json` | The OAuth access token (mode `0600`) |
+| `library.json` | The local mirror: unread, pending-archive, and tombstones |
+
+`library.json` is plain JSON and safe to read, grep, or back up. Writes are
+atomic, so an interrupted run can't corrupt it.
+
+## Notes on the Instapaper API
+
+Things worth knowing if you plan to hack on this:
+
+- **xAuth only.** There is no request-token/authorize browser flow. OAuth 1.0a
+  with HMAC-SHA1, parameters in the `Authorization` header, everything POSTed.
+- **No offset pagination.** `bookmarks/list` caps at 500 items. The only way
+  through a bigger folder is to keep re-asking while listing what you already
+  hold in the `have` parameter, which the server then omits. `sync` loops on
+  this until a page comes back short.
+- **`delete_ids` is only trustworthy on the last page.** The docs say ids passed
+  in `have` that "would not have appeared within the given limit" come back as
+  deleted — which on a *full* page can just mean "further down the folder".
+  Acting on that mid-drain would evict live bookmarks, so `samling` ignores
+  `delete_ids` on every page except the short final one. Worst case a remote
+  deletion is noticed one sync later.
+- **`have` gets big.** Roughly 9 bytes per article, so a 20,000-item backlog
+  means a ~180 KB POST body. `sync` warns past 100 KB. If Instapaper ever starts
+  rejecting those, that's the reason.
+- **No bulk actions.** Unlike Pocket, archiving is one request per article, so
+  `sync` uses a small worker pool (`--concurrency`, default 4) and saves
+  progress as it goes.
+- **No word count.** The bookmark object is only `bookmark_id, url, title,
+  description, hash, time, progress, progress_timestamp, starred,
+  private_source`. Reading-time filters would need a `bookmarks/get_text` fetch
+  per article; not implemented.
+
+## Development
+
+```sh
+go test ./...
+go vet ./...
+```
+
+The tests cover the two things most likely to break silently: the OAuth 1.0a
+signature (checked against the worked example in RFC 5849 §3.4.1.1) and the
+drain loop's paging and `delete_ids` handling (checked against a fake server,
+including a deliberately hostile one that reports spurious deletions).
+
+## Name
+
+Norwegian, Danish and Swedish for "collection".
+
+## License
+
+MIT
