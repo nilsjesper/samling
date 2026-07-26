@@ -90,13 +90,21 @@ Pick and list flags:
   --starred          Only starred articles
   --unstarred        Only unstarred articles
   --seed N           Reproducible shuffle
-  --no-open          Print instead of opening (implied by 'list')
+  --no-open          Mark read without opening tabs — burn down a chunk you
+                     are never going to read (use 'list' to preview instead)
 
 Sync flags:
   --folder NAME      Instapaper folder to mirror: unread (default), starred,
                      archive, or a numeric id from 'samling folders'
   --dry-run          Report what would happen without changing anything
   --concurrency N    Parallel archive requests (default 4)
+
+The triage loop:
+  samling pick -n 20     open a batch of tabs
+                         close the ones you do not care about
+                         re-save the keepers with the Instapaper extension
+  samling sync           archives the rest; re-saved keepers are detected
+                         and kept, and older articles slide into view
 
 Setup:
   1. Request an API consumer key at
@@ -232,11 +240,15 @@ func cmdPick(args []string, open bool) error {
 		return errors.New("no unread articles match those filters")
 	}
 
+	// `pick` always commits; --no-open only suppresses the browser, which is how
+	// you burn down a chunk you have no intention of reading. `list` is the
+	// non-committing preview.
+	commit := open
 	shouldOpen := open && !*noOpen
 
 	// Commit the state change before opening anything, so an interrupted run
 	// can't serve the same article twice. `samling undo` reverses it.
-	if shouldOpen {
+	if commit {
 		lib.MarkRead(picks, time.Now())
 		if err := lib.Save(path); err != nil {
 			return err
@@ -255,10 +267,11 @@ func cmdPick(args []string, open bool) error {
 		}
 	}
 
-	if shouldOpen {
+	if commit {
 		fmt.Printf("\n%s marked read locally; run `samling sync` to archive %s in Instapaper.\n",
 			plural(len(picks), "article", "articles"), pronoun(len(picks)))
-		fmt.Println("Changed your mind? `samling undo`")
+		fmt.Println("Re-save any you actually want to read — sync will spot it and keep them.")
+		fmt.Println("Changed your mind entirely? `samling undo`")
 	}
 	return nil
 }

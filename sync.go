@@ -42,10 +42,13 @@ func cmdSync(args []string) error {
 	ctx, stop := signalContext()
 	defer stop()
 
-	if err := archivePending(ctx, client, lib, path, *concurrency, *dryRun); err != nil {
+	// Fetch before archiving. A re-saved article looks identical to a pending
+	// one except for its timestamp, so the archive pass has to know what the
+	// server currently considers unread before it starts archiving.
+	if err := drain(ctx, client, lib, *folder, *dryRun); err != nil {
 		return err
 	}
-	if err := drain(ctx, client, lib, *folder, *dryRun); err != nil {
+	if err := archivePending(ctx, client, lib, path, *concurrency, *dryRun); err != nil {
 		return err
 	}
 
@@ -178,31 +181,62 @@ func drain(ctx context.Context, client *instapaper.Client, lib *library.Library,
 		return err
 	}
 
-	collected := make(map[string]library.Bookmark, len(res.Bookmarks))
-	for _, b := range res.Bookmarks {
-		id := b.BookmarkID.String()
+	// Classify everything the server considers unread.
+	var (
+		fresh    []library.Bookmark // not seen before
+		refresh  []library.Bookmark // already mirrored
+		rescued  []library.Bookmark // re-saved by hand; must not be archived
+		stillDue int                // picked, not re-saved, still to archive
+	)
+	for _, ib := range res.Bookmarks {
+		id := ib.BookmarkID.String()
 		if id == "" {
 			continue
 		}
-		collected[id] = library.Bookmark{
+		b := library.Bookmark{
 			ID:          id,
-			URL:         b.URL,
-			Title:       b.Title,
-			Description: b.Description,
-			Hash:        b.Hash,
-			Time:        b.Time.Int64(),
-			Progress:    b.Progress.Float64(),
-			Starred:     b.Starred.Bool(),
+			URL:         ib.URL,
+			Title:       ib.Title,
+			Description: ib.Description,
+			Hash:        ib.Hash,
+			Time:        ib.Time.Int64(),
+			Progress:    ib.Progress.Float64(),
+			Starred:     ib.Starred.Bool(),
 			Folder:      folder,
+		}
+
+		switch e, pending := lib.Pending(id); {
+		case pending && b.Time > e.PickedAt:
+			// Saved again after we handed it to the browser: the triage
+			// gesture for "actually, I want to read this". Keep it.
+			rescued = append(rescued, b)
+		case pending:
+			// Still sitting where we left it, awaiting archive.
+			stillDue++
+		case lib.IsArchived(id):
+			// Tombstoned but back in Unread, so it was re-saved or unarchived
+			// deliberately. The user's action outranks our bookkeeping.
+			rescued = append(rescued, b)
+		default:
+			if _, known := lib.Bookmarks[id]; known {
+				refresh = append(refresh, b)
+			} else {
+				fresh = append(fresh, b)
+			}
 		}
 	}
 
 	// delete_ids reports ids from "have" that the server did not find in the
-	// folder. That is only safe to act on when the whole mirror fits inside the
-	// window: past that, an id could be absent simply because it sits below the
-	// 500-item cut, and evicting it would throw away a real article.
+	// folder -- but "not found" and "below the 500-item cut" are indistinguishable
+	// from here, so it is only safe to act on when everything we know about fits
+	// inside the window with room to spare.
+	//
+	// The margin matters. An earlier version trusted delete_ids at held == 500,
+	// and a single re-saved article rejoining the top of Unread pushed the last
+	// article out of the window, which came back as a delete_id and evicted a
+	// perfectly live article from the mirror.
 	held := len(lib.Bookmarks) + len(lib.Read)
-	trustDeletes := held <= instapaper.MaxListLimit
+	trustDeletes := held+len(res.Bookmarks) < instapaper.MaxListLimit
 	var deleteIDs []string
 	if trustDeletes {
 		for _, id := range res.DeleteIDs {
@@ -213,15 +247,15 @@ func drain(ctx context.Context, client *instapaper.Client, lib *library.Library,
 	}
 
 	if dryRun {
-		fresh := 0
-		for id := range collected {
-			if _, known := lib.Bookmarks[id]; !known {
-				fresh++
+		fmt.Printf("Would add %s and refresh %s.\n",
+			plural(len(fresh), "new article", "new articles"),
+			plural(len(refresh), "article", "articles"))
+		if len(rescued) > 0 {
+			fmt.Printf("Would rescue %s re-saved since being picked:\n", plural(len(rescued), "article", "articles"))
+			for _, b := range rescued {
+				fmt.Printf("  %s\n", titleOf(b))
 			}
 		}
-		fmt.Printf("Would add %s and refresh %s already mirrored.\n",
-			plural(fresh, "new article", "new articles"),
-			plural(len(collected)-fresh, "article", "articles"))
 		if len(deleteIDs) > 0 {
 			fmt.Printf("Would drop %s no longer in %s.\n", plural(len(deleteIDs), "article", "articles"), folder)
 		}
@@ -229,17 +263,20 @@ func drain(ctx context.Context, client *instapaper.Client, lib *library.Library,
 			fmt.Printf("Would not act on delete_ids: the mirror (%s) is larger than the %d-item window.\n",
 				comma(held), instapaper.MaxListLimit)
 		}
-		fmt.Printf("Local mirror currently holds %s unread.\n", comma(len(lib.Bookmarks)))
-		reportCeiling(len(res.Bookmarks), len(collected), folder)
+		fmt.Printf("Local mirror currently holds %s unread, %s awaiting archive.\n",
+			comma(len(lib.Bookmarks)), comma(stillDue))
+		reportCeiling(len(res.Bookmarks), folder)
 		return nil
 	}
 
-	added := 0
-	for _, b := range collected {
-		if _, known := lib.Bookmarks[b.ID]; !known {
-			added++
-		}
+	for _, b := range fresh {
 		lib.Upsert(b)
+	}
+	for _, b := range refresh {
+		lib.Upsert(b)
+	}
+	for _, b := range rescued {
+		lib.Rescue(b)
 	}
 	dropped := 0
 	for _, id := range deleteIDs {
@@ -249,22 +286,29 @@ func drain(ctx context.Context, client *instapaper.Client, lib *library.Library,
 		}
 	}
 
-	fmt.Printf("  %s new", plural(added, "article", "articles"))
-	if n := len(collected) - added; n > 0 {
-		fmt.Printf(", %s refreshed", comma(n))
+	fmt.Printf("  %s new", plural(len(fresh), "article", "articles"))
+	if len(refresh) > 0 {
+		fmt.Printf(", %s refreshed", comma(len(refresh)))
 	}
 	if dropped > 0 {
 		fmt.Printf(", %s no longer in %s", plural(dropped, "article", "articles"), folder)
 	}
 	fmt.Println()
 
-	reportCeiling(len(res.Bookmarks), added, folder)
+	if len(rescued) > 0 {
+		fmt.Printf("  kept %s you re-saved:\n", plural(len(rescued), "article", "articles"))
+		for _, b := range rescued {
+			fmt.Printf("    %s\n", titleOf(b))
+		}
+	}
+
+	reportCeiling(len(res.Bookmarks), folder)
 	return nil
 }
 
 // reportCeiling explains the 500-item wall the first time a sync hits it, so a
 // backlog that stops growing does not look like a bug.
-func reportCeiling(returned, added int, folder string) {
+func reportCeiling(returned int, folder string) {
 	if returned < instapaper.MaxListLimit {
 		return
 	}

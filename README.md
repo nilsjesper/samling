@@ -33,6 +33,36 @@ $ samling pick -n 3
  2. …
 ```
 
+## The triage loop
+
+The way this actually gets used:
+
+```sh
+samling pick -n 20    # opens 20 tabs
+```
+
+Work through the tabs. Close the ones you don't care about. For the ones you
+*do* want to read, hit the Instapaper extension to re-save them — which also
+floats them to the top of your Unread list.
+
+```sh
+samling sync          # archives the batch, keeps the ones you re-saved
+```
+
+samling detects the re-saves and leaves them alone. Re-saving reuses an
+article's `bookmark_id`, so without that detection your keepers would be
+archived by the very sync that follows, or stay tombstoned and never be served
+again. A deliberate re-save always outranks samling's bookkeeping.
+
+To burn down a chunk you're never going to read, skip the browser entirely:
+
+```sh
+samling pick -n 100 --older-than 1y --no-open
+samling sync
+```
+
+`list` is the non-committing preview; `pick` always commits.
+
 ## How it works
 
 Picking is **entirely offline**. `samling pick` reads a JSON file, chooses at
@@ -85,6 +115,7 @@ never written to disk; only the resulting token is stored.
 | `samling login` | Exchange username + password for an access token |
 | `samling sync` | Archive what you've read, then refresh the local mirror |
 | `samling pick` | Open N random unread articles, mark them read locally |
+| `samling pick --no-open` | Same, without tabs — bulk-skip a chunk |
 | `samling list` | Same selection as `pick`, printed instead of opened |
 | `samling status` | Unread / pending / archived counts, top domains, oldest article |
 | `samling undo` | Put the most recent pick back (before the next sync) |
@@ -168,11 +199,17 @@ Things worth knowing if you plan to hack on this:
 - **`bookmarks/list` is called at v1.1.** The v1 endpoint returns an array of
   typed objects and buries `delete_ids` as a comma-separated string on a `meta`
   element; v1.1 returns the documented object with `delete_ids` as an array.
-- **`delete_ids` is only trusted while the mirror fits in the window.** It
-  reports ids from `have` that weren't found in the folder. Once your mirror is
-  larger than 500, an id could be missing merely because it sits below the cut,
-  and evicting it would discard a real article. Worst case a remote deletion is
-  noticed later.
+- **`delete_ids` reports what fell outside the *window*, not what was deleted.**
+  An article still in your account but sitting below the 500-item cut comes back
+  as a `delete_id`, indistinguishable from a genuine deletion. samling therefore
+  acts on it only when everything it knows about fits inside the window with room
+  to spare. An earlier version trusted it at exactly 500 and a single re-saved
+  article — rejoining the top of Unread and displacing the last one — evicted a
+  live article from the mirror. Worst case now, a real deletion is noticed later.
+- **Re-saving reuses the `bookmark_id`** and refreshes the article's `time`.
+  That timestamp is the only way to tell "I re-saved this during triage" from
+  "this is still queued for archiving", which is why `sync` fetches before it
+  archives.
 - **`have` gets big.** Roughly 9 bytes per article, so a 20,000-item backlog
   means a ~180 KB POST body. `sync` warns past 100 KB. If Instapaper ever starts
   rejecting those, that's the reason.

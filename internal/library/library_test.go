@@ -178,9 +178,10 @@ func TestHost(t *testing.T) {
 	}
 }
 
-// HaveParam must cover unread, pending and archived, so that none of them come
-// back in the next bookmarks/list response.
-func TestHaveParamCoversEveryKnownID(t *testing.T) {
+// HaveParam covers unread articles only. Pending and archived ids are left out
+// on purpose: if either turns up in Unread anyway, it was re-saved by hand and
+// the sync needs to see it.
+func TestHaveParamCoversUnreadOnly(t *testing.T) {
 	l := New()
 	l.Bookmarks["1"] = Bookmark{ID: "1", Hash: "abc"}
 	l.Bookmarks["2"] = Bookmark{ID: "2"} // no hash yet
@@ -188,8 +189,43 @@ func TestHaveParamCoversEveryKnownID(t *testing.T) {
 	l.Archived = append(l.Archived, "4")
 	l.normalize()
 
-	if got, want := l.HaveParam(), "1:abc,2,3,4"; got != want {
+	if got, want := l.HaveParam(), "1:abc,2"; got != want {
 		t.Errorf("HaveParam() = %q, want %q", got, want)
+	}
+}
+
+// Re-saving an article reuses its bookmark id, so a rescue has to clear the
+// tombstone as well as the pending entry -- otherwise the keeper stays
+// invisible forever.
+func TestRescueClearsTombstoneAndPending(t *testing.T) {
+	l := seed(t, 3)
+	picks := l.Pick(1, Filter{}, testRNG())
+	id := picks[0].ID
+	l.MarkRead(picks, time.Now())
+	l.MarkArchived(id)
+	if !l.IsArchived(id) {
+		t.Fatal("setup: expected a tombstone")
+	}
+
+	l.Rescue(Bookmark{ID: id, URL: "https://example.com/" + id, Title: "Kept"})
+
+	if l.IsArchived(id) {
+		t.Error("tombstone survived the rescue")
+	}
+	for _, got := range l.Archived {
+		if got == id {
+			t.Error("id still present in the Archived slice")
+		}
+	}
+	if _, pending := l.Read[id]; pending {
+		t.Error("rescued article is still pending archive")
+	}
+	if _, unread := l.Bookmarks[id]; !unread {
+		t.Error("rescued article did not return to unread")
+	}
+	// And it is pickable again.
+	if got := l.Candidates(Filter{}); len(got) != 3 {
+		t.Errorf("%d candidates after rescue, want 3", len(got))
 	}
 }
 

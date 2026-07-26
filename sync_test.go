@@ -23,22 +23,21 @@ import (
 // fixed limit.
 type fakeInstapaper struct {
 	mu       sync.Mutex
-	order    []string        // folder contents, in order
-	gone     map[string]bool // removed from the folder since the client last looked
-	limit    int             // how deep into the folder the API will look
-	failIDs  map[string]bool // archive requests that should fail
+	order    []string         // folder contents, in order
+	gone     map[string]bool  // removed from the folder since the client last looked
+	limit    int              // how deep into the folder the API will look
+	failIDs  map[string]bool  // archive requests that should fail
+	times    map[string]int64 // per-article save time; defaults to a fixed past value
 	archived []string
 
 	listCalls, archiveCalls int
 }
 
-func (f *fakeInstapaper) known(id string) bool {
-	for _, o := range f.order {
-		if o == id {
-			return !f.gone[id]
-		}
+func (f *fakeInstapaper) timeOf(id string) int64 {
+	if t, ok := f.times[id]; ok {
+		return t
 	}
-	return false
+	return 1690000000
 }
 
 func (f *fakeInstapaper) handler() http.HandlerFunc {
@@ -78,15 +77,21 @@ func (f *fakeInstapaper) handler() http.HandlerFunc {
 				page = append(page, map[string]any{
 					"type": "bookmark", "bookmark_id": id,
 					"url": "https://example.com/" + id, "title": "Article " + id,
-					"hash": "h" + id, "time": 1690000000, "starred": "0",
+					"hash": "h" + id, "time": f.timeOf(id), "starred": "0",
 				})
 			}
 
-			// delete_ids reports ids the caller claims to have that are not in
-			// the folder at all -- verified against the live API.
+			// delete_ids reports ids from "have" that are not in the *window*.
+			// Crucially that includes articles still in the folder but pushed
+			// below the limit -- verified against the live API, and the source
+			// of a real eviction bug.
+			inWindow := make(map[string]bool, len(window))
+			for _, id := range window {
+				inWindow[id] = true
+			}
 			deleteIDs := []string{}
 			for id := range have {
-				if !f.known(id) {
+				if !inWindow[id] {
 					deleteIDs = append(deleteIDs, id)
 				}
 			}
@@ -199,29 +204,79 @@ func TestDrainAccumulatesAsTheWindowSlides(t *testing.T) {
 	}
 }
 
-// Once the mirror outgrows the window, an id missing from a response may simply
-// be below the cut rather than deleted, so delete_ids must be ignored.
-func TestDrainIgnoresDeleteIDsWhenMirrorExceedsWindow(t *testing.T) {
-	fake := &fakeInstapaper{order: ids(20), limit: 10}
+// A saturated window is the dangerous case: an id missing from the response may
+// simply have been pushed below the cut. Regression test for a real eviction --
+// a re-saved article rejoining the top of Unread displaced the last article,
+// which came back as a delete_id and was wrongly dropped from the mirror.
+func TestDrainIgnoresDeleteIDsWhenWindowIsSaturated(t *testing.T) {
+	// The mirror holds exactly a full window, then one article joins the top
+	// and pushes the last one below the cut.
+	fake := &fakeInstapaper{order: append([]string{"new"}, ids(500)...), limit: 500}
 	client := newFake(t, fake)
 
 	lib := library.New()
-	for _, id := range ids(20) { // mirror of 20 against a window of 10
+	for _, id := range ids(500) {
 		lib.Bookmarks[id] = library.Bookmark{ID: id, Hash: "h" + id}
 	}
 
 	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if len(lib.Bookmarks) != 20 {
-		t.Errorf("have %d bookmarks, want all 20 kept — delete_ids was acted on unsafely", len(lib.Bookmarks))
+	if _, ok := lib.Bookmarks["500"]; !ok {
+		t.Error("evicted a live article that was merely displaced from the window")
+	}
+	if _, ok := lib.Bookmarks["new"]; !ok {
+		t.Error("the newly arrived article was not picked up")
+	}
+	if len(lib.Bookmarks) != 501 {
+		t.Errorf("have %d bookmarks, want 501", len(lib.Bookmarks))
 	}
 }
 
-// Articles already archived must not be pulled back in, even if the server
-// still lists them.
-func TestDrainSkipsTombstonedArticles(t *testing.T) {
-	fake := &fakeInstapaper{order: ids(5), limit: 500}
+// Once the mirror outgrows the window, nothing reported missing can be trusted.
+func TestDrainIgnoresDeleteIDsWhenMirrorExceedsWindow(t *testing.T) {
+	fake := &fakeInstapaper{order: ids(600), limit: 500}
+	client := newFake(t, fake)
+
+	lib := library.New()
+	for _, id := range ids(600) {
+		lib.Bookmarks[id] = library.Bookmark{ID: id, Hash: "h" + id}
+	}
+
+	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(lib.Bookmarks) != 600 {
+		t.Errorf("have %d bookmarks, want all 600 kept", len(lib.Bookmarks))
+	}
+}
+
+// With plenty of headroom the signal is unambiguous, so articles removed
+// elsewhere really should disappear locally.
+func TestDrainHonoursDeleteIDsWhenWellInsideWindow(t *testing.T) {
+	fake := &fakeInstapaper{order: ids(10), limit: 500, gone: map[string]bool{"3": true}}
+	client := newFake(t, fake)
+
+	lib := library.New()
+	lib.Bookmarks["3"] = library.Bookmark{ID: "3", Hash: "h3"}    // archived elsewhere
+	lib.Bookmarks["99"] = library.Bookmark{ID: "99", Hash: "h99"} // never existed
+
+	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, id := range []string{"3", "99"} {
+		if _, ok := lib.Bookmarks[id]; ok {
+			t.Errorf("bookmark %s is gone remotely but survived locally", id)
+		}
+	}
+	if len(lib.Bookmarks) != 9 {
+		t.Errorf("have %d bookmarks, want 9", len(lib.Bookmarks))
+	}
+}
+
+// An article we archived that is no longer in the folder stays tombstoned.
+func TestDrainKeepsTombstoneWhileArticleStaysArchived(t *testing.T) {
+	fake := &fakeInstapaper{order: ids(5), limit: 500, gone: map[string]bool{"2": true}}
 	client := newFake(t, fake)
 
 	lib := library.New()
@@ -233,8 +288,112 @@ func TestDrainSkipsTombstonedArticles(t *testing.T) {
 	if _, ok := lib.Bookmarks["2"]; ok {
 		t.Error("an archived article was resurrected by the drain")
 	}
+	if !lib.IsArchived("2") {
+		t.Error("tombstone was cleared for an article still archived")
+	}
 	if len(lib.Bookmarks) != 4 {
 		t.Errorf("have %d bookmarks, want 4", len(lib.Bookmarks))
+	}
+}
+
+// ...but if it turns up in Unread again, it was re-saved by hand and must come
+// back. This is the "close the junk, re-save the keepers" triage habit.
+func TestDrainRescuesTombstonedArticleThatReappears(t *testing.T) {
+	fake := &fakeInstapaper{order: ids(5), limit: 500} // "2" is still in Unread
+	client := newFake(t, fake)
+
+	lib := library.New()
+	lib.MarkArchived("2")
+
+	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if _, ok := lib.Bookmarks["2"]; !ok {
+		t.Error("a re-saved article was not rescued")
+	}
+	if lib.IsArchived("2") {
+		t.Error("tombstone survived for a re-saved article")
+	}
+	if len(lib.Bookmarks) != 5 {
+		t.Errorf("have %d bookmarks, want 5", len(lib.Bookmarks))
+	}
+}
+
+// A pending article whose save time is newer than the pick was re-saved during
+// triage: it must be rescued rather than archived.
+func TestDrainRescuesPendingArticleReSavedAfterThePick(t *testing.T) {
+	now := time.Now()
+	fake := &fakeInstapaper{order: ids(3), limit: 500}
+	fake.times = map[string]int64{"1": now.Add(time.Minute).Unix()} // re-saved a minute ago
+	client := newFake(t, fake)
+
+	lib := library.New()
+	for _, id := range ids(3) {
+		lib.Bookmarks[id] = library.Bookmark{ID: id}
+	}
+	lib.MarkRead([]library.Bookmark{{ID: "1"}, {ID: "2"}}, now.Add(-time.Hour))
+
+	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if _, pending := lib.Pending("1"); pending {
+		t.Error("re-saved article is still queued for archiving")
+	}
+	if _, unread := lib.Bookmarks["1"]; !unread {
+		t.Error("re-saved article did not return to unread")
+	}
+	// The one that was not re-saved is untouched and still due for archiving.
+	if _, pending := lib.Pending("2"); !pending {
+		t.Error("an untouched pick was wrongly rescued")
+	}
+}
+
+// The whole triage loop: pick a batch, re-save one of them, sync. The keeper
+// must survive and everything else must be archived.
+func TestTriageLoopKeepsReSavedArticles(t *testing.T) {
+	now := time.Now()
+	fake := &fakeInstapaper{order: ids(10), limit: 500}
+	client := newFake(t, fake)
+	path := filepath.Join(t.TempDir(), "library.json")
+	ctx := context.Background()
+
+	lib := library.New()
+	if err := drain(ctx, client, lib, "unread", false); err != nil {
+		t.Fatalf("seed drain: %v", err)
+	}
+
+	picks := lib.Pick(4, library.Filter{}, newRNG(7, true))
+	lib.MarkRead(picks, now.Add(-time.Hour))
+	keeper := picks[0].ID
+
+	// The browser extension re-saves the keeper: same id, fresh timestamp.
+	fake.mu.Lock()
+	fake.times = map[string]int64{keeper: now.Unix()}
+	fake.mu.Unlock()
+
+	if err := drain(ctx, client, lib, "unread", false); err != nil {
+		t.Fatalf("sync drain: %v", err)
+	}
+	if err := archivePending(ctx, client, lib, path, 2, false); err != nil {
+		t.Fatalf("archivePending: %v", err)
+	}
+
+	if _, unread := lib.Bookmarks[keeper]; !unread {
+		t.Error("the re-saved keeper was not preserved")
+	}
+	if lib.IsArchived(keeper) {
+		t.Error("the re-saved keeper was archived anyway")
+	}
+	for _, id := range fake.archived {
+		if id == keeper {
+			t.Error("an archive request was sent for the keeper")
+		}
+	}
+	if len(fake.archived) != 3 {
+		t.Errorf("archived %d articles, want 3 (the batch minus the keeper)", len(fake.archived))
+	}
+	if len(lib.Bookmarks) != 7 {
+		t.Errorf("%d unread, want 7", len(lib.Bookmarks))
 	}
 }
 

@@ -166,6 +166,38 @@ func (l *Library) Upsert(b Bookmark) {
 	l.Bookmarks[b.ID] = b
 }
 
+// Rescue restores an article to unread, clearing any tombstone and dropping it
+// from the pending-archive set.
+//
+// This is what happens when an article we archived (or were about to) turns up
+// in Instapaper's Unread folder again. Re-saving a URL reuses its bookmark id,
+// so the triage habit of "open a batch, re-save the keepers" would otherwise be
+// invisible here: the keeper would stay tombstoned and never be served again,
+// or worse, get archived by the sync that follows. A deliberate re-save
+// outranks our bookkeeping.
+func (l *Library) Rescue(b Bookmark) {
+	if l.archived == nil {
+		l.normalize()
+	}
+	delete(l.Read, b.ID)
+	if _, tombstoned := l.archived[b.ID]; tombstoned {
+		delete(l.archived, b.ID)
+		for i, id := range l.Archived {
+			if id == b.ID {
+				l.Archived = append(l.Archived[:i], l.Archived[i+1:]...)
+				break
+			}
+		}
+	}
+	l.Bookmarks[b.ID] = b
+}
+
+// Pending returns the pending-archive entry for an id, if there is one.
+func (l *Library) Pending(id string) (ReadEntry, bool) {
+	e, ok := l.Read[id]
+	return e, ok
+}
+
 // Filter narrows which bookmarks are eligible to be picked.
 type Filter struct {
 	Folder    string        // match Bookmark.Folder exactly; empty matches all
@@ -284,12 +316,17 @@ func (l *Library) PendingArchive() []ReadEntry {
 	return out
 }
 
-// HaveParam builds the delta-sync "have" value for bookmarks/list: every id the
-// client already holds, with its hash where known so the server can report
-// metadata changes. Unread bookmarks, pending-archive articles and tombstones
-// are all included, since none of them should come back in the response.
+// HaveParam builds the "have" value for bookmarks/list: the unread articles the
+// client already holds, with their hashes so the server can report metadata
+// changes.
+//
+// Pending-archive articles and tombstones are deliberately left out. Both are
+// ids we could suppress to save bandwidth, but seeing them is the whole point:
+// an article we plan to archive, or already archived, that still shows up in
+// Unread has been re-saved by hand, and Rescue needs to hear about it. The cost
+// is re-receiving a handful of pending articles each sync.
 func (l *Library) HaveParam() string {
-	parts := make([]string, 0, len(l.Bookmarks)+len(l.Read)+len(l.Archived))
+	parts := make([]string, 0, len(l.Bookmarks))
 	for id, b := range l.Bookmarks {
 		if b.Hash != "" {
 			parts = append(parts, id+":"+b.Hash)
@@ -297,10 +334,6 @@ func (l *Library) HaveParam() string {
 			parts = append(parts, id)
 		}
 	}
-	for id := range l.Read {
-		parts = append(parts, id)
-	}
-	parts = append(parts, l.Archived...)
 	sort.Strings(parts)
 	return strings.Join(parts, ",")
 }
