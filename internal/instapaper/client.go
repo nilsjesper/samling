@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/molson/samling/internal/oauth1"
+	"github.com/nilsjesper/samling/internal/oauth1"
 )
 
 // BaseURL is the API root. Overridable per-client for tests.
@@ -245,7 +245,7 @@ func (c *Client) attempt(ctx context.Context, endpoint string, params url.Values
 	req.Header.Set("Authorization", auth)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "samling/1.0 (+https://github.com/molson/samling)")
+	req.Header.Set("User-Agent", "samling/1.0 (+https://github.com/nilsjesper/samling)")
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {

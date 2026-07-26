@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/molson/samling/internal/oauth1"
+	"github.com/nilsjesper/samling/internal/oauth1"
 )
 
 func newTestClient(t *testing.T, h http.HandlerFunc) *Client {

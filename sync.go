@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/molson/samling/internal/instapaper"
-	"github.com/molson/samling/internal/library"
+	"github.com/nilsjesper/samling/internal/instapaper"
+	"github.com/nilsjesper/samling/internal/library"
 )
 
 // maxDrainPages bounds the drain loop. At 500 bookmarks a page this covers

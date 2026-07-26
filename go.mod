@@ -1,4 +1,4 @@
-module github.com/molson/samling
+module github.com/nilsjesper/samling
 
 go 1.26
 

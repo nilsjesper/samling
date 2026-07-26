@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/molson/samling/internal/instapaper"
-	"github.com/molson/samling/internal/library"
-	"github.com/molson/samling/internal/oauth1"
+	"github.com/nilsjesper/samling/internal/instapaper"
+	"github.com/nilsjesper/samling/internal/library"
+	"github.com/nilsjesper/samling/internal/oauth1"
 )
 
 // fakeInstapaper models bookmarks/list closely enough to exercise the drain

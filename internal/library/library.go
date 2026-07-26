@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/molson/samling/internal/config"
+	"github.com/nilsjesper/samling/internal/config"
 )
 
 // Version is the schema version of the on-disk file.

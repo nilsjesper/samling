@@ -21,11 +21,11 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/molson/samling/internal/browse"
-	"github.com/molson/samling/internal/config"
-	"github.com/molson/samling/internal/instapaper"
-	"github.com/molson/samling/internal/library"
-	"github.com/molson/samling/internal/oauth1"
+	"github.com/nilsjesper/samling/internal/browse"
+	"github.com/nilsjesper/samling/internal/config"
+	"github.com/nilsjesper/samling/internal/instapaper"
+	"github.com/nilsjesper/samling/internal/library"
+	"github.com/nilsjesper/samling/internal/oauth1"
 )
 
 func main() {

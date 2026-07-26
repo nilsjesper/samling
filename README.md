@@ -46,7 +46,7 @@ twice, even if a later sync still reports it as unread.
 ## Install
 
 ```sh
-go install github.com/molson/samling@latest
+go install github.com/nilsjesper/samling@latest
 ```
 
 Or build from a checkout: `go build -o samling .`
