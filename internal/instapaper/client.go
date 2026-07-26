@@ -89,6 +89,11 @@ type ListResult struct {
 	DeleteIDs []flexString `json:"delete_ids"`
 }
 
+// ErrUnauthorized reports an HTTP 401. What that means depends on the call: on
+// the xAuth endpoint it is a bad username or password, and everywhere else it
+// is a token that is no longer good, so callers phrase it themselves.
+var ErrUnauthorized = errors.New("unauthorized")
+
 // APIError is a typed error object returned by the API.
 type APIError struct {
 	Code    int
@@ -111,6 +116,11 @@ func (c *Client) AccessToken(ctx context.Context, username, password string) (to
 		"x_auth_mode":     {"client_auth"},
 	}, false)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return "", "", fmt.Errorf("Instapaper rejected that username and password.\n" +
+				"If you sign in to Instapaper with Google or Apple rather than a password,\n" +
+				"set an Instapaper password at https://www.instapaper.com/user first.")
+		}
 		return "", "", err
 	}
 	vals, err := url.ParseQuery(strings.TrimSpace(string(body)))
@@ -186,6 +196,9 @@ func (c *Client) Folders(ctx context.Context) ([]Folder, error) {
 func (c *Client) call(ctx context.Context, path string, params url.Values, out any) error {
 	body, err := c.raw(ctx, path, params, true)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return fmt.Errorf("%s: token rejected — run `samling login` again", path)
+		}
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	if err := apiError(body); err != nil {
@@ -262,7 +275,7 @@ func (c *Client) attempt(ctx context.Context, endpoint string, params url.Values
 	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
 		return nil, &retryableError{fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))}
 	case resp.StatusCode == http.StatusUnauthorized:
-		return nil, fmt.Errorf("HTTP 401: token rejected, run `samling login` again")
+		return nil, fmt.Errorf("%w (HTTP 401)", ErrUnauthorized)
 	case resp.StatusCode >= 400:
 		if err := apiError(body); err != nil {
 			return nil, err

@@ -435,8 +435,11 @@ func prompt(msg string) (string, error) {
 func promptPassword(msg string) (string, error) {
 	fd := int(syscall.Stdin)
 	if !term.IsTerminal(fd) {
-		// Piped input: read a line normally so scripts still work.
-		return prompt(msg)
+		// Piped input: read a line normally so scripts still work. Nothing was
+		// echoed, so supply the newline the terminal path would have produced.
+		s, err := prompt(msg)
+		fmt.Println()
+		return s, err
 	}
 	fmt.Print(msg)
 	b, err := term.ReadPassword(fd)

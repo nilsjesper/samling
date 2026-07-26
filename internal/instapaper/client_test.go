@@ -184,6 +184,36 @@ func TestClientErrorIsNotRetried(t *testing.T) {
 	}
 }
 
+// A 401 means different things on different endpoints, and the message has to
+// match: bad username/password during login, stale token everywhere else.
+func TestUnauthorizedIsPhrasedPerEndpoint(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+
+	_, _, err := c.AccessToken(context.Background(), "u", "wrong")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "username and password") {
+		t.Errorf("login error should blame the credentials, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "samling login") {
+		t.Errorf("login error should not tell the user to run login again, got: %v", err)
+	}
+
+	err = c.Archive(context.Background(), "1")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "samling login") {
+		t.Errorf("non-login error should point at re-authenticating, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "token rejected") {
+		t.Errorf("unexpected message: %v", err)
+	}
+}
+
 func TestVerifyCredentials(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]map[string]any{
