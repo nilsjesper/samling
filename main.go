@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"os/signal"
@@ -75,14 +76,17 @@ Usage:
 Commands:
   login     Exchange your Instapaper username and password for an access token
   sync      Archive what you've read, then refresh the local unread mirror
-  pick      Open N random unread articles and mark them read locally
-  list      Same selection as pick, printed instead of opened
+  pick N    Open N random unread articles and mark them read locally
+  list N    Same selection as pick, printed instead of opened
   status    Show unread / pending / archived counts
   undo      Put the most recent pick back (only works before the next sync)
   folders   List your Instapaper folder ids
 
+Pick and list take the count as a bare argument (default 1):
+  samling pick 20
+  samling list 5 --older-than 1y
+
 Pick and list flags:
-  -n N               How many articles (default 1)
   --folder NAME      Only articles in this folder (as stored locally)
   --domain HOST      Only articles from this host, e.g. nytimes.com
   --older-than SPAN  Only articles saved at least SPAN ago, e.g. 90d, 2w, 36h
@@ -100,7 +104,7 @@ Sync flags:
   --concurrency N    Parallel archive requests (default 4)
 
 The triage loop:
-  samling pick -n 20     open a batch of tabs
+  samling pick 20        open a batch of tabs
                          close the ones you do not care about
                          re-save the keepers with the Instapaper extension
   samling sync           archives the rest; re-saved keepers are detected
@@ -111,7 +115,7 @@ Setup:
      https://www.instapaper.com/developers/applications/create
   2. Put it in ~/.samling/config.json as {"consumer_key":"...","consumer_secret":"..."}
      or set INSTAPAPER_CONSUMER_KEY / INSTAPAPER_CONSUMER_SECRET
-  3. samling login && samling sync && samling pick -n 3
+  3. samling login && samling sync && samling pick 3
 
 State lives in ~/.samling (override with SAMLING_HOME).
 Picking is entirely offline; only 'sync', 'login' and 'folders' touch the network.
@@ -193,18 +197,28 @@ func cmdPick(args []string, open bool) error {
 	unstarred := fs.Bool("unstarred", false, "only unstarred articles")
 	seed := fs.Int64("seed", 0, "reproducible shuffle")
 	noOpen := fs.Bool("no-open", false, "print instead of opening")
+	// A leading bare count has to come off before Parse; flag stops at the first
+	// non-flag argument, so anything after it would be silently ignored.
+	leading := -1
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		if v, err := strconv.Atoi(args[0]); err == nil {
+			leading, args = v, args[1:]
+		}
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	count, err := resolvePickCount(leading, *n, fs.Args())
+	if err != nil {
+		return err
+	}
+	*n = count
+
 	if *starred && *unstarred {
 		return errors.New("--starred and --unstarred are mutually exclusive")
 	}
-	if *n < 1 {
-		return errors.New("-n must be at least 1")
-	}
 
 	filter := library.Filter{Folder: *folder, Domain: *domain}
-	var err error
 	if filter.OlderThan, err = parseSpan(*olderThan); err != nil {
 		return err
 	}
@@ -535,4 +549,45 @@ func comma(n int) string {
 		return "-" + s
 	}
 	return s
+}
+
+// resolvePickCount reconciles the three ways a count can arrive: a bare
+// argument before the flags, one after them, or the legacy -n.
+func resolvePickCount(leading, nFlag int, trailing []string) (int, error) {
+	count := leading
+	for _, extra := range trailing {
+		v, err := strconv.Atoi(extra)
+		if err != nil {
+			return 0, fmt.Errorf("unexpected argument %q", extra)
+		}
+		if count >= 0 {
+			return 0, fmt.Errorf("give the count once, not twice (%d and %d)", count, v)
+		}
+		count = v
+	}
+	if count < 0 {
+		count = nFlag
+	}
+	if count < 1 {
+		return 0, fmt.Errorf("the count must be at least 1, got %d", count)
+	}
+	return count, nil
+}
+
+// parsePickCount runs the same argument handling as cmdPick, for tests.
+func parsePickCount(args []string) (int, error) {
+	leading := -1
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		if v, err := strconv.Atoi(args[0]); err == nil {
+			leading, args = v, args[1:]
+		}
+	}
+	fs := flag.NewFlagSet("pick", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	n := fs.Int("n", 1, "")
+	fs.String("older-than", "", "")
+	if err := fs.Parse(args); err != nil {
+		return 0, err
+	}
+	return resolvePickCount(leading, *n, fs.Args())
 }

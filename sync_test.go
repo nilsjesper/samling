@@ -588,3 +588,42 @@ func BenchmarkPickFromLargeBacklog(b *testing.B) {
 		lib.Pick(5, library.Filter{}, rng)
 	}
 }
+
+// The count is a bare argument, and it has to survive being written on either
+// side of the flags. Go's flag package stops at the first non-flag argument, so
+// `pick 20 --older-than 1y` would otherwise parse the count and silently drop
+// the filter.
+func TestPickCountArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		want    int
+		wantErr bool
+	}{
+		{"bare count", []string{"20"}, 20, false},
+		{"count then flags", []string{"20", "--older-than", "1y"}, 20, false},
+		{"flags then count", []string{"--older-than", "1y", "20"}, 20, false},
+		{"legacy -n", []string{"-n", "7"}, 7, false},
+		{"default", nil, 1, false},
+		{"count twice", []string{"3", "4"}, 0, true},
+		{"not a number", []string{"banana"}, 0, true},
+		{"zero", []string{"0"}, 0, true},
+		{"negative", []string{"-n", "-3"}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parsePickCount(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got count %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("count = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

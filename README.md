@@ -26,7 +26,7 @@ Top domains:
     118  theatlantic.com
      97  longreads.com
 
-$ samling pick -n 3
+$ samling pick 3
  1. A Brief History of the Interrobang
     https://www.theatlantic.com/…
     theatlantic.com · saved 2 years ago
@@ -38,7 +38,7 @@ $ samling pick -n 3
 The way this actually gets used:
 
 ```sh
-samling pick -n 20    # opens 20 tabs
+samling pick 20       # opens 20 tabs
 ```
 
 Work through the tabs. Close the ones you don't care about. For the ones you
@@ -57,7 +57,7 @@ again. A deliberate re-save always outranks samling's bookkeeping.
 To burn down a chunk you're never going to read, skip the browser entirely:
 
 ```sh
-samling pick -n 100 --older-than 1y --no-open
+samling pick 100 --older-than 1y --no-open
 samling sync
 ```
 
@@ -101,7 +101,7 @@ Or build from a checkout: `go build -o samling .`
    ```sh
    samling login    # prompts for your Instapaper username and password
    samling sync     # pulls your unread list down
-   samling pick -n 3
+   samling pick 3
    ```
 
 Instapaper's API only supports xAuth, so `login` trades your username and
@@ -114,9 +114,9 @@ never written to disk; only the resulting token is stored.
 |---|---|
 | `samling login` | Exchange username + password for an access token |
 | `samling sync` | Archive what you've read, then refresh the local mirror |
-| `samling pick` | Open N random unread articles, mark them read locally |
-| `samling pick --no-open` | Same, without tabs — bulk-skip a chunk |
-| `samling list` | Same selection as `pick`, printed instead of opened |
+| `samling pick N` | Open N random unread articles, mark them read locally |
+| `samling pick N --no-open` | Same, without tabs — bulk-skip a chunk |
+| `samling list N` | Same selection as `pick`, printed instead of opened |
 | `samling status` | Unread / pending / archived counts, top domains, oldest article |
 | `samling undo` | Put the most recent pick back (before the next sync) |
 | `samling folders` | List your Instapaper folder ids |
@@ -126,11 +126,11 @@ never written to disk; only the resulting token is stored.
 `pick` and `list` take the same filters:
 
 ```sh
-samling pick -n 5 --older-than 1y          # dig into the deep backlog
+samling pick 5 --older-than 1y             # dig into the deep backlog
 samling pick --domain nytimes.com          # matches subdomains too
 samling pick --newer-than 7d               # only things saved this week
 samling pick --starred                     # or --unstarred
-samling list -n 10 --seed 42               # reproducible shuffle
+samling list 10 --seed 42                  # reproducible shuffle
 samling pick --folder 1234567              # a folder id from `samling folders`
 ```
 
@@ -160,7 +160,7 @@ adds whatever is newly visible. Since archiving removes an article from Unread,
 every article you read slides one more into the window:
 
 ```sh
-samling pick -n 5     # read five
+samling pick 5        # read five
 samling sync          # archives them; five older ones become visible
 ```
 
