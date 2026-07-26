@@ -25,14 +25,9 @@ type fakeInstapaper struct {
 	mu       sync.Mutex
 	order    []string        // folder contents, in order
 	gone     map[string]bool // removed from the folder since the client last looked
-	limit    int
+	limit    int             // how deep into the folder the API will look
 	failIDs  map[string]bool // archive requests that should fail
 	archived []string
-
-	// hostile makes the server report every id in "have" as deleted whenever it
-	// returns a full page — the pessimistic reading of the delete_ids docs.
-	// The client must not act on that.
-	hostile bool
 
 	listCalls, archiveCalls int
 }
@@ -53,7 +48,7 @@ func (f *fakeInstapaper) handler() http.HandlerFunc {
 		r.ParseForm()
 
 		switch r.URL.Path {
-		case "/api/1/bookmarks/list":
+		case "/api/1.1/bookmarks/list":
 			f.listCalls++
 			have := map[string]bool{}
 			if v := r.PostForm.Get("have"); v != "" {
@@ -62,9 +57,22 @@ func (f *fakeInstapaper) handler() http.HandlerFunc {
 				}
 			}
 
-			var page []map[string]any
+			// The real API takes the first `limit` items of the folder and only
+			// then subtracts `have`, which is why it cannot page past `limit`.
+			var window []string
 			for _, id := range f.order {
-				if f.gone[id] || have[id] {
+				if f.gone[id] {
+					continue
+				}
+				window = append(window, id)
+				if len(window) == f.limit {
+					break
+				}
+			}
+
+			page := []map[string]any{}
+			for _, id := range window {
+				if have[id] {
 					continue
 				}
 				page = append(page, map[string]any{
@@ -72,21 +80,14 @@ func (f *fakeInstapaper) handler() http.HandlerFunc {
 					"url": "https://example.com/" + id, "title": "Article " + id,
 					"hash": "h" + id, "time": 1690000000, "starred": "0",
 				})
-				if len(page) == f.limit {
-					break
-				}
 			}
 
+			// delete_ids reports ids the caller claims to have that are not in
+			// the folder at all -- verified against the live API.
 			deleteIDs := []string{}
-			if f.hostile && len(page) == f.limit {
-				for id := range have {
+			for id := range have {
+				if !f.known(id) {
 					deleteIDs = append(deleteIDs, id)
-				}
-			} else {
-				for id := range have {
-					if !f.known(id) {
-						deleteIDs = append(deleteIDs, id)
-					}
 				}
 			}
 
@@ -139,9 +140,9 @@ func ids(n int) []string {
 	return out
 }
 
-// A backlog bigger than one page must be drained by repeatedly re-asking with a
-// growing "have" list, since bookmarks/list has no offset parameter.
-func TestDrainPagesThroughAFolderLargerThanOnePage(t *testing.T) {
+// The API exposes only the newest MaxListLimit items of a folder and offers no
+// way past that, so one sync mirrors the window, not the whole backlog.
+func TestDrainMirrorsTheVisibleWindow(t *testing.T) {
 	fake := &fakeInstapaper{order: ids(1200), limit: 500}
 	client := newFake(t, fake)
 	lib := library.New()
@@ -149,75 +150,71 @@ func TestDrainPagesThroughAFolderLargerThanOnePage(t *testing.T) {
 	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if len(lib.Bookmarks) != 1200 {
-		t.Errorf("collected %d bookmarks, want 1200", len(lib.Bookmarks))
+	if len(lib.Bookmarks) != 500 {
+		t.Errorf("mirrored %d bookmarks, want 500 (the window)", len(lib.Bookmarks))
 	}
-	if fake.listCalls != 3 { // 500 + 500 + 200
-		t.Errorf("made %d list calls, want 3", fake.listCalls)
-	}
-	for _, id := range []string{"1", "500", "501", "1200"} {
-		if _, ok := lib.Bookmarks[id]; !ok {
-			t.Errorf("bookmark %s missing from the mirror", id)
-		}
+	if fake.listCalls != 1 {
+		t.Errorf("made %d list calls, want 1 — there is nothing to page through", fake.listCalls)
 	}
 	if b := lib.Bookmarks["7"]; b.Hash != "h7" || b.Folder != "unread" {
 		t.Errorf("bookmark 7 = %+v, want hash h7 and folder unread", b)
 	}
 }
 
-// An exactly-full final page still terminates: the follow-up call returns
-// nothing new and the loop stops.
-func TestDrainHandlesExactMultipleOfPageSize(t *testing.T) {
-	fake := &fakeInstapaper{order: ids(1000), limit: 500}
+// The mirror is cumulative: archiving slides the window, and the next sync
+// picks up whatever moved into view. This is the only way to reach a backlog
+// deeper than the window.
+func TestDrainAccumulatesAsTheWindowSlides(t *testing.T) {
+	fake := &fakeInstapaper{order: ids(600), limit: 500}
 	client := newFake(t, fake)
-	lib := library.New()
+	path := filepath.Join(t.TempDir(), "library.json")
+	ctx := context.Background()
 
-	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
-		t.Fatalf("drain: %v", err)
+	lib := library.New()
+	if err := drain(ctx, client, lib, "unread", false); err != nil {
+		t.Fatalf("first drain: %v", err)
 	}
-	if len(lib.Bookmarks) != 1000 {
-		t.Errorf("collected %d bookmarks, want 1000", len(lib.Bookmarks))
+	if len(lib.Bookmarks) != 500 {
+		t.Fatalf("first sync mirrored %d, want 500", len(lib.Bookmarks))
+	}
+
+	// Read and archive 100 of them, which slides the window.
+	picks := lib.Pick(100, library.Filter{}, newRNG(1, true))
+	lib.MarkRead(picks, time.Now())
+	if err := archivePending(ctx, client, lib, path, 4, false); err != nil {
+		t.Fatalf("archivePending: %v", err)
+	}
+	if len(lib.Archived) != 100 {
+		t.Fatalf("archived %d, want 100", len(lib.Archived))
+	}
+
+	if err := drain(ctx, client, lib, "unread", false); err != nil {
+		t.Fatalf("second drain: %v", err)
+	}
+	if len(lib.Bookmarks) != 500 {
+		t.Errorf("after the window slid: %d unread, want 500", len(lib.Bookmarks))
+	}
+	if total := len(lib.Bookmarks) + len(lib.Archived); total != 600 {
+		t.Errorf("saw %d distinct articles across two syncs, want 600", total)
 	}
 }
 
-// The load-bearing safety rule. delete_ids on a full page may just mean
-// "further down the folder", so acting on it mid-drain would evict live
-// bookmarks. Against a server that reports exactly that, nothing may be lost.
-func TestDrainIgnoresDeleteIDsOnFullPages(t *testing.T) {
-	fake := &fakeInstapaper{order: ids(1200), limit: 500, hostile: true}
+// Once the mirror outgrows the window, an id missing from a response may simply
+// be below the cut rather than deleted, so delete_ids must be ignored.
+func TestDrainIgnoresDeleteIDsWhenMirrorExceedsWindow(t *testing.T) {
+	fake := &fakeInstapaper{order: ids(20), limit: 10}
 	client := newFake(t, fake)
+
 	lib := library.New()
+	for _, id := range ids(20) { // mirror of 20 against a window of 10
+		lib.Bookmarks[id] = library.Bookmark{ID: id, Hash: "h" + id}
+	}
 
 	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if len(lib.Bookmarks) != 1200 {
-		t.Fatalf("collected %d bookmarks, want 1200 — spurious delete_ids were honoured", len(lib.Bookmarks))
-	}
-}
-
-// On a short final page the server has covered the whole folder, so delete_ids
-// is meaningful and articles removed elsewhere should disappear locally.
-func TestDrainHonoursDeleteIDsOnTheFinalPage(t *testing.T) {
-	fake := &fakeInstapaper{order: ids(10), limit: 500, gone: map[string]bool{"3": true}}
-	client := newFake(t, fake)
-
-	lib := library.New()
-	// The client still believes 3 is unread, and 99 was never on the server.
-	lib.Bookmarks["3"] = library.Bookmark{ID: "3", Hash: "h3"}
-	lib.Bookmarks["99"] = library.Bookmark{ID: "99", Hash: "h99"}
-
-	if err := drain(context.Background(), client, lib, "unread", false); err != nil {
-		t.Fatalf("drain: %v", err)
-	}
-	if _, ok := lib.Bookmarks["3"]; ok {
-		t.Error("bookmark 3 was removed remotely but survived locally")
-	}
-	if _, ok := lib.Bookmarks["99"]; ok {
-		t.Error("bookmark 99 does not exist remotely but survived locally")
-	}
-	if len(lib.Bookmarks) != 9 {
-		t.Errorf("have %d bookmarks, want 9", len(lib.Bookmarks))
+	if len(lib.Bookmarks) != 20 {
+		t.Errorf("have %d bookmarks, want all 20 kept — delete_ids was acted on unsafely", len(lib.Bookmarks))
 	}
 }
 
@@ -417,28 +414,6 @@ func TestComma(t *testing.T) {
 		if got := comma(tc.in); got != tc.want {
 			t.Errorf("comma(%d) = %s, want %s", tc.in, got, tc.want)
 		}
-	}
-}
-
-func TestAppendHaveDoesNotDuplicate(t *testing.T) {
-	collected := map[string]library.Bookmark{
-		"1": {ID: "1", Hash: "a"},
-		"2": {ID: "2"},
-	}
-	got := appendHave("9:z", collected)
-	parts := strings.Split(got, ",")
-	seen := map[string]bool{}
-	for _, p := range parts {
-		if seen[p] {
-			t.Errorf("duplicate entry %q in %q", p, got)
-		}
-		seen[p] = true
-	}
-	if len(parts) != 3 {
-		t.Errorf("got %d entries (%q), want 3", len(parts), got)
-	}
-	if !seen["9:z"] || !seen["1:a"] || !seen["2"] {
-		t.Errorf("unexpected have value %q", got)
 	}
 }
 

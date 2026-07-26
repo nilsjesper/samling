@@ -118,6 +118,24 @@ samling undo
 That only works before the next `sync`. Once an article has actually been
 archived in Instapaper, unarchive it there.
 
+## Reaching a deep backlog
+
+The API will not show you more than the newest 500 unread articles, and there is
+no parameter that changes that. If your backlog is larger, samling can't see all
+of it at once — nothing can, through this API.
+
+What it does instead is accumulate. `library.json` is never wiped; each sync
+adds whatever is newly visible. Since archiving removes an article from Unread,
+every article you read slides one more into the window:
+
+```sh
+samling pick -n 5     # read five
+samling sync          # archives them; five older ones become visible
+```
+
+So the mirror grows as you work through it, and `status` will show the total
+climbing past 500 over time.
+
 ## Files
 
 Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
@@ -137,16 +155,24 @@ Things worth knowing if you plan to hack on this:
 
 - **xAuth only.** There is no request-token/authorize browser flow. OAuth 1.0a
   with HMAC-SHA1, parameters in the `Authorization` header, everything POSTed.
-- **No offset pagination.** `bookmarks/list` caps at 500 items. The only way
-  through a bigger folder is to keep re-asking while listing what you already
-  hold in the `have` parameter, which the server then omits. `sync` loops on
-  this until a page comes back short.
-- **`delete_ids` is only trustworthy on the last page.** The docs say ids passed
-  in `have` that "would not have appeared within the given limit" come back as
-  deleted — which on a *full* page can just mean "further down the folder".
-  Acting on that mid-drain would evict live bookmarks, so `samling` ignores
-  `delete_ids` on every page except the short final one. Worst case a remote
-  deletion is noticed one sync later.
+- **500 per folder, and no way past it.** `bookmarks/list` has no offset and no
+  cursor. The `have` parameter looks like pagination but isn't: the server takes
+  the first `limit` items of the folder and *then* subtracts `have`, so asking
+  again with everything you hold returns nothing rather than the next page.
+  Verified against the live API. A folder with 5,000 articles will only ever
+  expose its newest 500.
+
+  This is why samling's mirror is **cumulative** rather than a snapshot.
+  Archiving an article removes it from Unread, which slides the window, so each
+  sync uncovers a little more of the backlog. See "Reaching a deep backlog".
+- **`bookmarks/list` is called at v1.1.** The v1 endpoint returns an array of
+  typed objects and buries `delete_ids` as a comma-separated string on a `meta`
+  element; v1.1 returns the documented object with `delete_ids` as an array.
+- **`delete_ids` is only trusted while the mirror fits in the window.** It
+  reports ids from `have` that weren't found in the folder. Once your mirror is
+  larger than 500, an id could be missing merely because it sits below the cut,
+  and evicting it would discard a real article. Worst case a remote deletion is
+  noticed later.
 - **`have` gets big.** Roughly 9 bytes per article, so a 20,000-item backlog
   means a ~180 KB POST body. `sync` warns past 100 KB. If Instapaper ever starts
   rejecting those, that's the reason.

@@ -5,8 +5,11 @@
 //     Authorization header.
 //   - Authentication is xAuth only: username + password -> access token. There
 //     is no request-token/authorize browser flow.
-//   - Most responses are a JSON array of typed objects, but bookmarks/list
-//     returns a bare object and oauth/access_token returns form-encoded text.
+//   - Most responses are a JSON array of typed objects. oauth/access_token
+//     answers in form-encoded text, and bookmarks/list is called at version 1.1
+//     because v1 returns an array that buries delete_ids on a "meta" element.
+//   - bookmarks/list caps at 500 per folder with no way to page further; see
+//     MaxListLimit.
 //   - Field types are inconsistent (starred arrives as "1" or 1), so scalars are
 //     decoded through the flexible types at the bottom of this file.
 //   - A response that is not valid JSON means "503, retry later" per the docs.
@@ -30,7 +33,11 @@ import (
 // BaseURL is the API root. Overridable per-client for tests.
 const BaseURL = "https://www.instapaper.com"
 
-// MaxListLimit is the largest page bookmarks/list will return.
+// MaxListLimit is the largest number of items bookmarks/list will return, and
+// because the "have" parameter filters after the limit rather than before it,
+// this is also a hard ceiling on how far into a folder the API can see. There
+// is no offset parameter and no cursor. A folder with 5,000 articles will only
+// ever expose its newest 500 until some of them leave the folder.
 const MaxListLimit = 500
 
 // Client talks to the Instapaper API.
@@ -147,10 +154,18 @@ func (c *Client) VerifyCredentials(ctx context.Context) (User, error) {
 	return users[0], nil
 }
 
-// List fetches one page of bookmarks. folder is "unread", "starred", "archive",
-// or a numeric folder id. have is the delta-sync parameter: a comma-separated
-// list of "id" or "id:hash" entries the caller already holds, which the server
-// omits from the response.
+// List fetches bookmarks from a folder. folder is "unread", "starred",
+// "archive", or a numeric folder id.
+//
+// Two things about this endpoint are not obvious from the docs and were
+// established by probing the live API:
+//
+//   - Version 1 answers with an array of typed objects and hides delete_ids as
+//     a comma-separated string on a "meta" element. Version 1.1 answers with
+//     the documented object. This uses 1.1.
+//   - have is a de-duplication filter, NOT pagination. The server takes the
+//     first `limit` items of the folder and then subtracts have, so a folder
+//     can never be read past `limit`. See MaxListLimit.
 func (c *Client) List(ctx context.Context, folder string, limit int, have string) (*ListResult, error) {
 	if limit <= 0 || limit > MaxListLimit {
 		limit = MaxListLimit
@@ -163,7 +178,7 @@ func (c *Client) List(ctx context.Context, folder string, limit int, have string
 		params.Set("have", have)
 	}
 	var out ListResult
-	if err := c.call(ctx, "/api/1/bookmarks/list", params, &out); err != nil {
+	if err := c.call(ctx, "/api/1.1/bookmarks/list", params, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

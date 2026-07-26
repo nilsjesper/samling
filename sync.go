@@ -13,10 +13,6 @@ import (
 	"github.com/nilsjesper/samling/internal/library"
 )
 
-// maxDrainPages bounds the drain loop. At 500 bookmarks a page this covers
-// 100,000 articles; it exists only so a server-side surprise can't spin forever.
-const maxDrainPages = 200
-
 // haveWarnThreshold is where the "have" parameter gets big enough to be worth
 // mentioning, since it all has to fit in one POST body.
 const haveWarnThreshold = 100_000
@@ -159,152 +155,120 @@ feed:
 
 // drain refreshes the local mirror of a folder.
 //
-// bookmarks/list has no offset parameter: the only way through a folder larger
-// than the 500-item page limit is to keep re-asking while telling the server
-// what you already hold via "have". Each pass therefore adds the ids it just
-// received to "have" and asks again, until a page comes back short.
+// The API has no pagination. bookmarks/list applies its 500-item limit first
+// and only then subtracts the ids passed in "have", so a folder can never be
+// read past its newest 500 entries -- see instapaper.MaxListLimit.
+//
+// So the mirror is cumulative rather than a snapshot. Each sync asks for the
+// current window minus everything already known, and adds whatever is new.
+// Because archiving an article removes it from Unread, the window slides as
+// you read, and each subsequent sync uncovers a little more of the backlog.
 func drain(ctx context.Context, client *instapaper.Client, lib *library.Library, folder string, dryRun bool) error {
-	baseHave := lib.HaveParam()
-	have := baseHave
+	have := lib.HaveParam()
 	if len(have) > haveWarnThreshold {
 		fmt.Fprintf(os.Stderr,
 			"note: the delta-sync parameter is %s characters; if Instapaper starts rejecting\n"+
-				"      requests, this is why — see the README.\n", comma(len(have)))
+				"      requests, this is why -- see the README.\n", comma(len(have)))
 	}
-
-	collected := map[string]library.Bookmark{}
-	var (
-		deleteIDs    []string
-		trustDeletes bool
-		pages        int
-	)
 
 	fmt.Printf("Fetching %s...\n", folder)
 
-	for pages = 1; pages <= maxDrainPages; pages++ {
-		if ctx.Err() != nil {
-			return fmt.Errorf("interrupted while fetching")
-		}
-
-		res, err := client.List(ctx, folder, instapaper.MaxListLimit, have)
-		if err != nil {
-			return err
-		}
-
-		added := 0
-		for _, b := range res.Bookmarks {
-			id := b.BookmarkID.String()
-			if id == "" {
-				continue
-			}
-			if _, seen := collected[id]; !seen {
-				added++
-			}
-			collected[id] = library.Bookmark{
-				ID:          id,
-				URL:         b.URL,
-				Title:       b.Title,
-				Description: b.Description,
-				Hash:        b.Hash,
-				Time:        b.Time.Int64(),
-				Progress:    b.Progress.Float64(),
-				Starred:     b.Starred.Bool(),
-				Folder:      folder,
-			}
-		}
-
-		if len(res.Bookmarks) < instapaper.MaxListLimit {
-			// The server had room to spare, so it covered the whole folder.
-			//
-			// This is the only point at which delete_ids can be trusted. The
-			// API reports ids from "have" that "would not have appeared within
-			// the given limit" — on a short page that means genuinely gone, but
-			// on a full page it just means "further down the folder", and
-			// honouring it mid-loop would evict live bookmarks.
-			trustDeletes = true
-			for _, id := range res.DeleteIDs {
-				if s := id.String(); s != "" {
-					deleteIDs = append(deleteIDs, s)
-				}
-			}
-			break
-		}
-		if added == 0 {
-			// A full page with nothing new: the server is not honouring "have"
-			// the way we expect. Stop rather than loop forever, and don't act
-			// on delete_ids we can't interpret.
-			fmt.Fprintln(os.Stderr,
-				"note: stopped early — a full page returned no new articles.")
-			break
-		}
-
-		// Rebuild from the base each pass; appending to the previous value
-		// would repeat everything collected in earlier passes.
-		have = appendHave(baseHave, collected)
-		fmt.Printf("  %s so far...\n", comma(len(collected)))
+	res, err := client.List(ctx, folder, instapaper.MaxListLimit, have)
+	if err != nil {
+		return err
 	}
 
-	if pages > maxDrainPages {
-		fmt.Fprintf(os.Stderr, "note: stopped after %d pages; run sync again to continue.\n", maxDrainPages)
+	collected := make(map[string]library.Bookmark, len(res.Bookmarks))
+	for _, b := range res.Bookmarks {
+		id := b.BookmarkID.String()
+		if id == "" {
+			continue
+		}
+		collected[id] = library.Bookmark{
+			ID:          id,
+			URL:         b.URL,
+			Title:       b.Title,
+			Description: b.Description,
+			Hash:        b.Hash,
+			Time:        b.Time.Int64(),
+			Progress:    b.Progress.Float64(),
+			Starred:     b.Starred.Bool(),
+			Folder:      folder,
+		}
+	}
+
+	// delete_ids reports ids from "have" that the server did not find in the
+	// folder. That is only safe to act on when the whole mirror fits inside the
+	// window: past that, an id could be absent simply because it sits below the
+	// 500-item cut, and evicting it would throw away a real article.
+	held := len(lib.Bookmarks) + len(lib.Read)
+	trustDeletes := held <= instapaper.MaxListLimit
+	var deleteIDs []string
+	if trustDeletes {
+		for _, id := range res.DeleteIDs {
+			if s := id.String(); s != "" {
+				deleteIDs = append(deleteIDs, s)
+			}
+		}
 	}
 
 	if dryRun {
-		fmt.Printf("Would add or update %s in the local mirror.\n", plural(len(collected), "article", "articles"))
-		if trustDeletes && len(deleteIDs) > 0 {
-			fmt.Printf("Would drop %s that are no longer in %s.\n", plural(len(deleteIDs), "article", "articles"), folder)
+		fresh := 0
+		for id := range collected {
+			if _, known := lib.Bookmarks[id]; !known {
+				fresh++
+			}
+		}
+		fmt.Printf("Would add %s and refresh %s already mirrored.\n",
+			plural(fresh, "new article", "new articles"),
+			plural(len(collected)-fresh, "article", "articles"))
+		if len(deleteIDs) > 0 {
+			fmt.Printf("Would drop %s no longer in %s.\n", plural(len(deleteIDs), "article", "articles"), folder)
+		}
+		if !trustDeletes {
+			fmt.Printf("Would not act on delete_ids: the mirror (%s) is larger than the %d-item window.\n",
+				comma(held), instapaper.MaxListLimit)
 		}
 		fmt.Printf("Local mirror currently holds %s unread.\n", comma(len(lib.Bookmarks)))
+		reportCeiling(len(res.Bookmarks), len(collected), folder)
 		return nil
 	}
 
+	added := 0
 	for _, b := range collected {
+		if _, known := lib.Bookmarks[b.ID]; !known {
+			added++
+		}
 		lib.Upsert(b)
 	}
 	dropped := 0
-	if trustDeletes {
-		for _, id := range deleteIDs {
-			if _, ok := lib.Bookmarks[id]; ok {
-				delete(lib.Bookmarks, id)
-				dropped++
-			}
+	for _, id := range deleteIDs {
+		if _, ok := lib.Bookmarks[id]; ok {
+			delete(lib.Bookmarks, id)
+			dropped++
 		}
 	}
 
-	fmt.Printf("  %s new or updated", plural(len(collected), "article", "articles"))
+	fmt.Printf("  %s new", plural(added, "article", "articles"))
+	if n := len(collected) - added; n > 0 {
+		fmt.Printf(", %s refreshed", comma(n))
+	}
 	if dropped > 0 {
 		fmt.Printf(", %s no longer in %s", plural(dropped, "article", "articles"), folder)
 	}
 	fmt.Println()
+
+	reportCeiling(len(res.Bookmarks), added, folder)
 	return nil
 }
 
-// appendHave extends the delta-sync parameter with everything collected so far.
-func appendHave(have string, collected map[string]library.Bookmark) string {
-	parts := make([]string, 0, len(collected)+1)
-	if have != "" {
-		parts = append(parts, have)
+// reportCeiling explains the 500-item wall the first time a sync hits it, so a
+// backlog that stops growing does not look like a bug.
+func reportCeiling(returned, added int, folder string) {
+	if returned < instapaper.MaxListLimit {
+		return
 	}
-	for id, b := range collected {
-		if b.Hash != "" {
-			parts = append(parts, id+":"+b.Hash)
-		} else {
-			parts = append(parts, id)
-		}
-	}
-	return joinComma(parts)
-}
-
-func joinComma(parts []string) string {
-	total := 0
-	for _, p := range parts {
-		total += len(p) + 1
-	}
-	buf := make([]byte, 0, total)
-	for i, p := range parts {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, p...)
-	}
-	return string(buf)
+	fmt.Printf("\nInstapaper only exposes the newest %d items of %s, and offers no way\n"+
+		"to page past that. As you archive what you have read, older articles move\n"+
+		"into view and the next sync will pick them up.\n", instapaper.MaxListLimit, folder)
 }
