@@ -18,11 +18,14 @@ type Config struct {
 	ConsumerSecret string `json:"consumer_secret"`
 }
 
-// Token is the per-user OAuth access token returned by xAuth. The password used
-// to obtain it is never stored.
+// Token is the per-user access token. The field names date from xAuth and are
+// kept so existing installs keep working: an xAuth oauth_token doubles as an
+// API v2 bearer token. Tokens from OAuth 2 or "Generate access token" have no
+// secret, so TokenSecret is only set by the deprecated xAuth login and only
+// matters for OAuth 1.0a-signed v1 calls. No password is ever stored.
 type Token struct {
 	Token       string `json:"oauth_token"`
-	TokenSecret string `json:"oauth_token_secret"`
+	TokenSecret string `json:"oauth_token_secret,omitempty"`
 	UserID      int64  `json:"user_id,omitempty"`
 	Username    string `json:"username,omitempty"`
 }
@@ -94,7 +97,7 @@ func LoadToken() (Token, error) {
 	if err != nil {
 		return t, err
 	}
-	if t.Token == "" || t.TokenSecret == "" {
+	if t.Token == "" {
 		return t, ErrNoToken
 	}
 	return t, nil

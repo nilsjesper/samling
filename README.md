@@ -96,23 +96,43 @@ Or build from a checkout: `go build -o samling .`
    or via `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`, which take
    precedence.
 
-3. **Log in and sync.**
+3. **Let samling sign in.** Pick one:
+
+   - **Browser sign-in (the default).** On your application's page under
+     [Applications](https://www.instapaper.com/developers/applications), add
+     `http://127.0.0.1:8919/callback` to the Callback URIs. Instapaper only
+     accepts a local callback on an application in "Owner Only" mode, which is
+     what a personal key is anyway. Then `samling login` opens the consent page
+     and catches the redirect on that port. If 8919 is taken, use
+     `samling login --port N` and register that port's URI instead.
+   - **Access token.** On the same page, select "Generate access token", then
+     run `samling login --token` and paste it at the (hidden) prompt, or pipe it
+     in: `pbpaste | samling login --token`. It's never accepted as an argument,
+     so it stays out of your shell history. One token works on every machine,
+     but regenerating it revokes the old one everywhere.
+
+4. **Sync and pick.**
 
    ```sh
-   samling login    # prompts for your Instapaper username and password
+   samling login
    samling sync     # pulls your unread list down
    samling pick 3
    ```
 
-Instapaper's API only supports xAuth, so `login` trades your username and
-password for a long-lived token in a single call. The password is used once and
-never written to disk; only the resulting token is stored.
+Either way, samling never sees your password. `login` checks the token with a
+cheap API call before saving it, and only the token is stored.
+
+The old password login is still there as `samling login --password`. It uses
+xAuth, which Instapaper turns off for new sign-ins on **2027-09-30**; tokens it
+already issued keep working after that, so existing installs don't need to log
+in again.
 
 ## Commands
 
 | | |
 |---|---|
-| `samling login` | Exchange username + password for an access token |
+| `samling login` | Sign in through the browser and save an access token |
+| `samling login --token` | Save a token from "Generate access token" instead |
 | `samling sync` | Archive what you've read, then refresh the local mirror |
 | `samling pick N` | Open N random unread articles, mark them read locally |
 | `samling pick N --no-open` | Same, without tabs — bulk-skip a chunk |
@@ -174,7 +194,7 @@ Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
 | file | |
 |---|---|
 | `config.json` | Your consumer key and secret |
-| `token.json` | The OAuth access token (mode `0600`) |
+| `token.json` | Your access token (mode `0600`) |
 | `library.json` | The local mirror: unread, pending-archive, and tombstones |
 
 `library.json` is plain JSON and safe to read, grep, or back up. Writes are
