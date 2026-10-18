@@ -6,20 +6,33 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/nilsjesper/samling/internal/instapaper"
 	"github.com/nilsjesper/samling/internal/library"
 )
 
-// haveWarnThreshold is where the "have" parameter gets big enough to be worth
-// mentioning, since it all has to fit in one POST body.
-const haveWarnThreshold = 100_000
+// cursorOverlap is how far before a sync's start the next change feed begins.
+// It absorbs clock skew between this machine and Instapaper's servers. Reading
+// a change twice is harmless, because classifying a bookmark is idempotent;
+// missing one is not.
+const cursorOverlap = 10 * time.Minute
+
+// syncOptions selects what drain reads.
+type syncOptions struct {
+	Folder string // library.Unread or a numeric folder id
+	Full   bool   // force a full read even when the change feed would do
+	DryRun bool
+}
 
 func cmdSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
-	folder := fs.String("folder", "unread", "Instapaper folder to mirror: unread, starred, archive, or a numeric id")
+	folder := fs.String("folder", library.Unread, "Instapaper folder to mirror: unread, or a numeric id")
+	full := fs.Bool("full", false, "re-read the whole folder instead of only what changed")
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
 	concurrency := fs.Int("concurrency", 4, "parallel archive requests")
 	if err := fs.Parse(args); err != nil {
@@ -27,6 +40,10 @@ func cmdSync(args []string) error {
 	}
 	if *concurrency < 1 {
 		return errors.New("--concurrency must be at least 1")
+	}
+	f, err := syncFolder(*folder)
+	if err != nil {
+		return err
 	}
 
 	client, err := newClient()
@@ -45,7 +62,7 @@ func cmdSync(args []string) error {
 	// Fetch before archiving. A re-saved article looks identical to a pending
 	// one except for its timestamp, so the archive pass has to know what the
 	// server currently considers unread before it starts archiving.
-	if err := drain(ctx, client, lib, *folder, *dryRun); err != nil {
+	if err := drain(ctx, client, lib, syncOptions{Folder: f, Full: *full, DryRun: *dryRun}); err != nil {
 		return err
 	}
 	if err := archivePending(ctx, client, lib, path, *concurrency, *dryRun); err != nil {
@@ -63,6 +80,23 @@ func cmdSync(args []string) error {
 	}
 	fmt.Printf("\n%s unread · %s archived\n", comma(len(lib.Bookmarks)), comma(len(lib.Archived)))
 	return nil
+}
+
+// syncFolder validates --folder. v1 also accepted the "starred" and "archive"
+// pseudo-folders; v2 sync drops both rather than translating them.
+func syncFolder(s string) (string, error) {
+	switch s {
+	case library.Unread, "home", "":
+		return library.Unread, nil
+	case "starred", "liked":
+		return "", errors.New("starred is an attribute, not a folder: sync unread and use `pick --starred`")
+	case "archive":
+		return "", errors.New("the archive is not mirrored: samling picks from what you have not read yet")
+	}
+	if _, err := strconv.ParseUint(s, 10, 64); err != nil {
+		return "", fmt.Errorf("--folder must be unread or a numeric id from `samling folders`, not %q", s)
+	}
+	return s, nil
 }
 
 // archivePending archives every article picked since the last sync. Instapaper
@@ -98,7 +132,7 @@ func archivePending(ctx context.Context, client *instapaper.Client, lib *library
 		go func() {
 			defer wg.Done()
 			for e := range jobs {
-				err := client.Archive(ctx, e.ID)
+				_, err := client.Move(ctx, e.ID, instapaper.SectionArchive)
 
 				mu.Lock()
 				switch {
@@ -156,163 +190,335 @@ feed:
 	return nil
 }
 
-// drain refreshes the local mirror of a folder.
+// drain brings the local mirror up to date with Instapaper.
 //
-// The API has no pagination. bookmarks/list applies its 500-item limit first
-// and only then subtracts the ids passed in "have", so a folder can never be
-// read past its newest 500 entries -- see instapaper.MaxListLimit.
+// There are two ways to do that, and a sync may need both:
 //
-// So the mirror is cumulative rather than a snapshot. Each sync asks for the
-// current window minus everything already known, and adds whatever is new.
-// Because archiving an article removes it from Unread, the window slides as
-// you read, and each subsequent sync uncovers a little more of the backlog.
-func drain(ctx context.Context, client *instapaper.Client, lib *library.Library, folder string, dryRun bool) error {
-	have := lib.HaveParam()
-	if len(have) > haveWarnThreshold {
-		fmt.Fprintf(os.Stderr,
-			"note: the delta-sync parameter is %s characters; if Instapaper starts rejecting\n"+
-				"      requests, this is why -- see the README.\n", comma(len(have)))
-	}
+//   - A full read pages through the whole folder. The result is a snapshot, so
+//     it is authoritative: anything mirrored from that folder that does not
+//     come back has left it. This is how a folder gets into the mirror in the
+//     first place, and what --full forces.
+//   - The change feed (`since`) returns only what changed since the cursor,
+//     across the whole account, plus ids deleted outright. That keeps every
+//     folder that has had a full read current, in a request or two.
+//
+// The feed alone is enough once the requested folder has been read in full
+// and a cursor exists. Otherwise the folder gets a full read, and the feed
+// still runs for any other synced folder so that the cursor advancing past
+// their changes does not lose them.
+//
+// The cursor only advances when everything succeeded, and never on a dry run.
+func drain(ctx context.Context, client *instapaper.Client, lib *library.Library, o syncOptions) error {
+	start := time.Now()
 
-	fmt.Printf("Fetching %s...\n", folder)
-
-	res, err := client.List(ctx, folder, instapaper.MaxListLimit, have)
-	if err != nil {
-		return err
-	}
-
-	// Classify everything the server considers unread.
-	var (
-		fresh    []library.Bookmark // not seen before
-		refresh  []library.Bookmark // already mirrored
-		rescued  []library.Bookmark // re-saved by hand; must not be archived
-		stillDue int                // picked, not re-saved, still to archive
-	)
-	for _, ib := range res.Bookmarks {
-		id := ib.BookmarkID.String()
-		if id == "" {
-			continue
-		}
-		b := library.Bookmark{
-			ID:          id,
-			URL:         ib.URL,
-			Title:       ib.Title,
-			Description: ib.Description,
-			Hash:        ib.Hash,
-			Time:        ib.Time.Int64(),
-			Progress:    ib.Progress.Float64(),
-			Starred:     ib.Starred.Bool(),
-			Folder:      folder,
-		}
-
-		switch e, pending := lib.Pending(id); {
-		case pending && b.Time > e.PickedAt:
-			// Saved again after we handed it to the browser: the triage
-			// gesture for "actually, I want to read this". Keep it.
-			rescued = append(rescued, b)
-		case pending:
-			// Still sitting where we left it, awaiting archive.
-			stillDue++
-		case lib.IsArchived(id):
-			// Tombstoned but back in Unread, so it was re-saved or unarchived
-			// deliberately. The user's action outranks our bookkeeping.
-			rescued = append(rescued, b)
-		default:
-			if _, known := lib.Bookmarks[id]; known {
-				refresh = append(refresh, b)
-			} else {
-				fresh = append(fresh, b)
-			}
+	// With no cursor nothing is current, whatever Synced says.
+	synced := map[string]bool{}
+	if lib.Cursor > 0 {
+		for _, f := range lib.Synced {
+			synced[f] = true
 		}
 	}
+	full := o.Full || !synced[o.Folder]
 
-	// delete_ids reports ids from "have" that the server did not find in the
-	// folder -- but "not found" and "below the 500-item cut" are indistinguishable
-	// from here, so it is only safe to act on when everything we know about fits
-	// inside the window with room to spare.
-	//
-	// The margin matters. An earlier version trusted delete_ids at held == 500,
-	// and a single re-saved article rejoining the top of Unread pushed the last
-	// article out of the window, which came back as a delete_id and evicted a
-	// perfectly live article from the mirror.
-	held := len(lib.Bookmarks) + len(lib.Read)
-	trustDeletes := held+len(res.Bookmarks) < instapaper.MaxListLimit
-	var deleteIDs []string
-	if trustDeletes {
-		for _, id := range res.DeleteIDs {
-			if s := id.String(); s != "" {
-				deleteIDs = append(deleteIDs, s)
-			}
+	if full {
+		p, err := readFolder(ctx, client, lib, o.Folder)
+		if err != nil {
+			return err
 		}
+		finish(lib, p, o.DryRun)
+		delete(synced, o.Folder) // the snapshot covered it; the feed must not
+	}
+	if len(synced) > 0 {
+		skip := ""
+		if full {
+			skip = o.Folder
+		}
+		p, err := readFeed(ctx, client, lib, lib.Cursor, synced, skip)
+		if err != nil {
+			return err
+		}
+		finish(lib, p, o.DryRun)
 	}
 
-	if dryRun {
-		fmt.Printf("Would add %s and refresh %s.\n",
-			plural(len(fresh), "new article", "new articles"),
-			plural(len(refresh), "article", "articles"))
-		if len(rescued) > 0 {
-			fmt.Printf("Would rescue %s re-saved since being picked:\n", plural(len(rescued), "article", "articles"))
-			for _, b := range rescued {
-				fmt.Printf("  %s\n", titleOf(b))
-			}
-		}
-		if len(deleteIDs) > 0 {
-			fmt.Printf("Would drop %s no longer in %s.\n", plural(len(deleteIDs), "article", "articles"), folder)
-		}
-		if !trustDeletes {
-			fmt.Printf("Would not act on delete_ids: the mirror (%s) is larger than the %d-item window.\n",
-				comma(held), instapaper.MaxListLimit)
-		}
+	if o.DryRun {
 		fmt.Printf("Local mirror currently holds %s unread, %s awaiting archive.\n",
-			comma(len(lib.Bookmarks)), comma(stillDue))
-		reportCeiling(len(res.Bookmarks), folder)
+			comma(len(lib.Bookmarks)), comma(len(lib.Read)))
 		return nil
 	}
-
-	for _, b := range fresh {
-		lib.Upsert(b)
+	if lib.Cursor == 0 {
+		lib.Synced = nil
 	}
-	for _, b := range refresh {
-		lib.Upsert(b)
+	if full {
+		lib.MarkSynced(o.Folder)
 	}
-	for _, b := range rescued {
-		lib.Rescue(b)
-	}
-	dropped := 0
-	for _, id := range deleteIDs {
-		if _, ok := lib.Bookmarks[id]; ok {
-			delete(lib.Bookmarks, id)
-			dropped++
-		}
-	}
-
-	fmt.Printf("  %s new", plural(len(fresh), "article", "articles"))
-	if len(refresh) > 0 {
-		fmt.Printf(", %s refreshed", comma(len(refresh)))
-	}
-	if dropped > 0 {
-		fmt.Printf(", %s no longer in %s", plural(dropped, "article", "articles"), folder)
-	}
-	fmt.Println()
-
-	if len(rescued) > 0 {
-		fmt.Printf("  kept %s you re-saved:\n", plural(len(rescued), "article", "articles"))
-		for _, b := range rescued {
-			fmt.Printf("    %s\n", titleOf(b))
-		}
-	}
-
-	reportCeiling(len(res.Bookmarks), folder)
+	lib.Cursor = start.Add(-cursorOverlap).Unix()
 	return nil
 }
 
-// reportCeiling explains the 500-item wall the first time a sync hits it, so a
-// backlog that stops growing does not look like a bug.
-func reportCeiling(returned int, folder string) {
-	if returned < instapaper.MaxListLimit {
+// plan is what one read of the server means for the mirror. Building it is
+// read-only, so a dry run can report it and a real run can apply it.
+type plan struct {
+	source   string             // what was read, for messages
+	fresh    []library.Bookmark // not seen before
+	refresh  []library.Bookmark // already mirrored
+	rescued  []library.Bookmark // re-saved by hand; must not be archived
+	stillDue int                // picked, not re-saved, still to archive
+
+	gone      []string            // mirrored, but no longer in any mirrored folder
+	goneDue   []library.ReadEntry // picked, then archived or moved elsewhere
+	deleted   []string            // deleted from Instapaper outright
+	unchanged bool                // the feed came back empty
+}
+
+// readFolder pages through a whole folder and plans the mirror against it.
+func readFolder(ctx context.Context, client *instapaper.Client, lib *library.Library, folder string) (*plan, error) {
+	section := folder
+	if folder == library.Unread {
+		section = instapaper.SectionHome
+	}
+	fmt.Printf("Reading all of %s...\n", folder)
+	bms, err := client.ListAll(ctx, section, progressLine())
+	if err != nil {
+		return nil, err
+	}
+	endProgress()
+
+	p := &plan{source: folder}
+	seen := make(map[string]bool, len(bms))
+	for _, ib := range bms {
+		if ib.ID == 0 || ib.Archived {
+			continue
+		}
+		b := toLibrary(ib, folder)
+		if seen[b.ID] {
+			continue // offset paging shifted under us; see ListAll
+		}
+		seen[b.ID] = true
+		classify(lib, b, p)
+	}
+
+	// The snapshot is authoritative for its folder.
+	for id, b := range lib.Bookmarks {
+		if b.InFolder(folder) && !seen[id] {
+			p.gone = append(p.gone, id)
+		}
+	}
+	for id, e := range lib.Read {
+		if e.InFolder(folder) && !seen[id] {
+			// Picked here, and now gone: archived or deleted from another
+			// device. Nothing left to do remotely, so tombstone it as is.
+			p.goneDue = append(p.goneDue, e)
+		}
+	}
+	return p, nil
+}
+
+// readFeed reads the change feed since cursor and plans the mirror against it
+// for the folders in synced. Changes located in skip are left alone, because a
+// full read of that folder has just covered them.
+func readFeed(ctx context.Context, client *instapaper.Client, lib *library.Library, cursor int64, synced map[string]bool, skip string) (*plan, error) {
+	fmt.Println("Reading changes since the last sync...")
+	feed, err := client.SinceAll(ctx, cursor, progressLine())
+	if err != nil {
+		return nil, err
+	}
+	endProgress()
+
+	p := &plan{source: "the change feed"}
+	if len(feed.Bookmarks) == 0 && len(feed.DeletedIDs) == 0 {
+		p.unchanged = true
+		return p, nil
+	}
+
+	// A bookmark changed twice while we paged can appear twice; the later
+	// entry is the newer state.
+	latest := make(map[string]instapaper.Bookmark, len(feed.Bookmarks))
+	var order []string
+	for _, ib := range feed.Bookmarks {
+		if ib.ID == 0 {
+			continue
+		}
+		id := strconv.FormatInt(ib.ID, 10)
+		if _, dup := latest[id]; !dup {
+			order = append(order, id)
+		}
+		latest[id] = ib
+	}
+
+	for _, id := range order {
+		ib := latest[id]
+		loc := location(ib)
+		switch {
+		case skip != "" && loc == skip:
+		case synced[loc]:
+			classify(lib, toLibrary(ib, loc), p)
+		default:
+			// Archived, or moved to a folder that is not mirrored. Either way
+			// it is out of the pool; a pending pick needs no archive request.
+			if e, pending := lib.Pending(id); pending {
+				p.goneDue = append(p.goneDue, e)
+			} else if _, ok := lib.Bookmarks[id]; ok {
+				p.gone = append(p.gone, id)
+			}
+		}
+	}
+
+	for _, n := range feed.DeletedIDs {
+		id := strconv.FormatInt(n, 10)
+		_, mirrored := lib.Bookmarks[id]
+		_, pending := lib.Pending(id)
+		if mirrored || pending {
+			p.deleted = append(p.deleted, id)
+		}
+	}
+	return p, nil
+}
+
+// classify sorts one bookmark that is currently in a mirrored folder.
+func classify(lib *library.Library, b library.Bookmark, p *plan) {
+	switch e, pending := lib.Pending(b.ID); {
+	case pending && b.Time > e.PickedAt:
+		// Saved again after we handed it to the browser: the triage gesture
+		// for "actually, I want to read this". Keep it.
+		p.rescued = append(p.rescued, b)
+	case pending:
+		// Still sitting where we left it, awaiting archive.
+		p.stillDue++
+	case lib.IsArchived(b.ID):
+		// Tombstoned but back in a mirrored folder, so it was re-saved or
+		// unarchived deliberately. The user's action outranks our bookkeeping.
+		p.rescued = append(p.rescued, b)
+	default:
+		if _, known := lib.Bookmarks[b.ID]; known {
+			p.refresh = append(p.refresh, b)
+		} else {
+			p.fresh = append(p.fresh, b)
+		}
+	}
+}
+
+// location is where a bookmark lives, in the mirror's terms: library.Unread,
+// a numeric folder id, or "archive", which syncFolder never lets be mirrored.
+// archived wins over folder_id, since an archived bookmark is out of the pool
+// wherever it was filed. liked is an attribute and does not affect it.
+func location(ib instapaper.Bookmark) string {
+	switch {
+	case ib.Archived:
+		return instapaper.SectionArchive
+	case ib.FolderID == nil:
+		return library.Unread
+	default:
+		return strconv.FormatInt(*ib.FolderID, 10)
+	}
+}
+
+func toLibrary(ib instapaper.Bookmark, folder string) library.Bookmark {
+	b := library.Bookmark{
+		ID:          strconv.FormatInt(ib.ID, 10),
+		URL:         ib.URL,
+		Title:       ib.Title,
+		Description: ib.Description,
+		Time:        ib.Time,
+		Progress:    ib.Progress.Percentage,
+		Starred:     ib.Liked,
+		Folder:      folder,
+	}
+	for _, t := range ib.Tags {
+		b.Tags = append(b.Tags, t.Name)
+	}
+	return b
+}
+
+// finish reports a plan and, unless this is a dry run, applies it.
+func finish(lib *library.Library, p *plan, dryRun bool) {
+	report(p, dryRun)
+	if dryRun {
 		return
 	}
-	fmt.Printf("\nInstapaper only exposes the newest %d items of %s, and offers no way\n"+
-		"to page past that. As you archive what you have read, older articles move\n"+
-		"into view and the next sync will pick them up.\n", instapaper.MaxListLimit, folder)
+	for _, b := range p.fresh {
+		lib.Upsert(b)
+	}
+	for _, b := range p.refresh {
+		lib.Upsert(b)
+	}
+	for _, b := range p.rescued {
+		lib.Rescue(b)
+	}
+	for _, id := range p.gone {
+		lib.Drop(id)
+	}
+	for _, e := range p.goneDue {
+		lib.MarkArchived(e.ID)
+	}
+	for _, id := range p.deleted {
+		lib.Drop(id)
+	}
+}
+
+func report(p *plan, dryRun bool) {
+	if p.unchanged {
+		fmt.Println("  nothing changed")
+		return
+	}
+	would := func(s string) string {
+		if dryRun {
+			return "would " + s
+		}
+		return s
+	}
+
+	fmt.Printf("  %s %s", would("add"), plural(len(p.fresh), "new article", "new articles"))
+	if len(p.refresh) > 0 {
+		fmt.Printf(", %s %s", would("refresh"), comma(len(p.refresh)))
+	}
+	if len(p.gone) > 0 {
+		fmt.Printf(", %s %s no longer in %s", would("drop"),
+			plural(len(p.gone), "article", "articles"), sourceFolder(p))
+	}
+	if len(p.deleted) > 0 {
+		fmt.Printf(", %s %s deleted from Instapaper", would("forget"), plural(len(p.deleted), "article", "articles"))
+	}
+	fmt.Println()
+
+	if len(p.rescued) > 0 {
+		fmt.Printf("  %s %s you re-saved:\n", would("keep"), plural(len(p.rescued), "article", "articles"))
+		for _, b := range p.rescued {
+			fmt.Printf("    %s\n", titleOf(b))
+		}
+	}
+	if len(p.goneDue) > 0 {
+		fmt.Printf("  %s %s already archived or moved elsewhere:\n",
+			would("stop tracking"), plural(len(p.goneDue), "picked article", "picked articles"))
+		for _, e := range p.goneDue {
+			fmt.Printf("    %s\n", titleOf(e.Bookmark))
+		}
+	}
+	if dryRun && p.stillDue > 0 {
+		fmt.Printf("  %s still due for archiving\n", plural(p.stillDue, "picked article", "picked articles"))
+	}
+}
+
+func sourceFolder(p *plan) string {
+	if p.source == "the change feed" {
+		return "a mirrored folder"
+	}
+	return p.source
+}
+
+// progressLine returns a callback that keeps a running "12,000 / 23,858" on
+// one terminal line. Piped output gets nothing; there the line would just be
+// noise.
+func progressLine() instapaper.ProgressFunc {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return nil
+	}
+	return func(got, total int) {
+		fmt.Printf("\r  %s / %s", comma(got), comma(total))
+	}
+}
+
+func endProgress() {
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		fmt.Print("\r\033[K")
+	}
 }

@@ -2,7 +2,9 @@ package library
 
 import (
 	"math/rand/v2"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -178,22 +180,6 @@ func TestHost(t *testing.T) {
 	}
 }
 
-// HaveParam covers unread articles only. Pending and archived ids are left out
-// on purpose: if either turns up in Unread anyway, it was re-saved by hand and
-// the sync needs to see it.
-func TestHaveParamCoversUnreadOnly(t *testing.T) {
-	l := New()
-	l.Bookmarks["1"] = Bookmark{ID: "1", Hash: "abc"}
-	l.Bookmarks["2"] = Bookmark{ID: "2"} // no hash yet
-	l.Read["3"] = ReadEntry{Bookmark: Bookmark{ID: "3"}}
-	l.Archived = append(l.Archived, "4")
-	l.normalize()
-
-	if got, want := l.HaveParam(), "1:abc,2"; got != want {
-		t.Errorf("HaveParam() = %q, want %q", got, want)
-	}
-}
-
 // Re-saving an article reuses its bookmark id, so a rescue has to clear the
 // tombstone as well as the pending entry -- otherwise the keeper stays
 // invisible forever.
@@ -287,5 +273,113 @@ func TestStats(t *testing.T) {
 	}
 	if s.Oldest == nil || s.Oldest.ID != "1" {
 		t.Errorf("oldest = %+v, want id 1", s.Oldest)
+	}
+}
+
+// A library written by the v1 schema must load, keep everything the user has
+// invested in it (pending picks and tombstones), and come up with no cursor so
+// the next sync reads the whole backlog.
+func TestLoadMigratesV1Library(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "library.json")
+	v1 := `{
+	  "version": 1,
+	  "last_sync": 1760000000,
+	  "bookmarks": {
+	    "11": {"id":"11","url":"https://a.com/11","title":"Eleven","hash":"abc","time":1700000000,"folder":"unread"},
+	    "12": {"id":"12","url":"https://a.com/12","title":"Twelve","hash":"def","time":1700000001,"folder":"starred"},
+	    "13": {"id":"13","url":"https://a.com/13","title":"Thirteen","time":1700000002,"folder":"archive"},
+	    "14": {"id":"14","url":"https://a.com/14","title":"Fourteen","time":1700000003,"folder":"555"}
+	  },
+	  "read": {
+	    "21": {"id":"21","url":"https://a.com/21","title":"Picked","hash":"ghi","time":1700000004,"folder":"unread",
+	           "picked_at":1760000100,"batch":"b-1760000100"}
+	  },
+	  "archived": ["31","32"],
+	  "last_batch": "b-1760000100"
+	}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if l.Version != Version || l.Cursor != 0 || len(l.Synced) != 0 {
+		t.Errorf("version %d cursor %d synced %v; want v%d with no cursor", l.Version, l.Cursor, l.Synced, Version)
+	}
+	for _, id := range []string{"11", "14"} {
+		if _, ok := l.Bookmarks[id]; !ok {
+			t.Errorf("bookmark %s was lost in migration", id)
+		}
+	}
+	for _, id := range []string{"12", "13"} {
+		if _, ok := l.Bookmarks[id]; ok {
+			t.Errorf("bookmark %s from a pseudo-folder v2 cannot maintain survived", id)
+		}
+	}
+	if e, ok := l.Pending("21"); !ok || e.PickedAt != 1760000100 || e.Batch != "b-1760000100" {
+		t.Errorf("pending pick lost or damaged: %+v", e)
+	}
+	if !l.IsArchived("31") || !l.IsArchived("32") {
+		t.Error("tombstones lost in migration")
+	}
+	if l.LastBatch != "b-1760000100" || l.LastSync != 1760000000 {
+		t.Error("undo batch or last-sync time lost in migration")
+	}
+
+	// Saving writes the new schema, without the old hashes.
+	if err := l.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	b, _ := os.ReadFile(path)
+	if strings.Contains(string(b), `"hash"`) || !strings.Contains(string(b), `"version": 2`) {
+		t.Errorf("saved file is not clean v2:\n%s", b)
+	}
+}
+
+func TestCursorAndSyncedFoldersRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "library.json")
+	l := New()
+	l.Cursor = 1773238168
+	l.MarkSynced("unread")
+	l.MarkSynced("555")
+	l.MarkSynced("unread")
+	l.Bookmarks["1"] = Bookmark{ID: "1", Tags: []string{"Recipes", "Long"}}
+	if err := l.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Cursor != 1773238168 || !got.IsSynced("unread") || !got.IsSynced("555") || len(got.Synced) != 2 {
+		t.Errorf("cursor %d synced %v", got.Cursor, got.Synced)
+	}
+	if tags := got.Bookmarks["1"].Tags; len(tags) != 2 || tags[0] != "Recipes" {
+		t.Errorf("tags = %v", tags)
+	}
+}
+
+// Drop is for articles deleted remotely: gone from both sets, no tombstone.
+func TestDropForgetsWithoutTombstoning(t *testing.T) {
+	l := seed(t, 2)
+	picks := l.Pick(1, Filter{}, testRNG())
+	l.MarkRead(picks, time.Now())
+	l.Drop(picks[0].ID)
+	for id := range l.Bookmarks {
+		l.Drop(id)
+	}
+	if len(l.Bookmarks) != 0 || len(l.Read) != 0 || len(l.Archived) != 0 {
+		t.Errorf("after Drop: %d unread, %d pending, %d tombstones", len(l.Bookmarks), len(l.Read), len(l.Archived))
+	}
+}
+
+func TestInFolderTreatsUnsetAsUnread(t *testing.T) {
+	if !(Bookmark{}).InFolder(Unread) || (Bookmark{}).InFolder("555") {
+		t.Error("a bookmark with no folder should count as unread only")
+	}
+	if !(Bookmark{Folder: "555"}).InFolder("555") || (Bookmark{Folder: "555"}).InFolder(Unread) {
+		t.Error("a folder bookmark should match its own folder only")
 	}
 }

@@ -21,19 +21,38 @@ import (
 )
 
 // Version is the schema version of the on-disk file.
-const Version = 1
+//
+// v1 mirrored at most the newest 500 articles per folder through API v1 and
+// stored each one's "hash" for that API's delta sync. v2 mirrors whole folders
+// through API v2, adds tags, and keeps a change-feed cursor. A v1 file loads
+// with no cursor, which forces a full sync; pending picks and tombstones carry
+// over untouched, since bookmark ids are the same number in both APIs.
+const Version = 2
+
+// Unread is the local name of Instapaper's home list. The API calls it "home";
+// samling has always called it unread, and filters stored that way.
+const Unread = "unread"
 
 // Bookmark is an article in the local mirror.
 type Bookmark struct {
-	ID          string  `json:"id"`
-	URL         string  `json:"url"`
-	Title       string  `json:"title"`
-	Description string  `json:"description,omitempty"`
-	Hash        string  `json:"hash,omitempty"`
-	Time        int64   `json:"time"`
-	Progress    float64 `json:"progress,omitempty"`
-	Starred     bool    `json:"starred,omitempty"`
-	Folder      string  `json:"folder,omitempty"`
+	ID          string   `json:"id"`
+	URL         string   `json:"url"`
+	Title       string   `json:"title"`
+	Description string   `json:"description,omitempty"`
+	Time        int64    `json:"time"`
+	Progress    float64  `json:"progress,omitempty"`
+	Starred     bool     `json:"starred,omitempty"` // "liked" in API v2
+	Folder      string   `json:"folder,omitempty"`  // Unread or a numeric folder id
+	Tags        []string `json:"tags,omitempty"`
+}
+
+// InFolder reports whether b is mirrored from folder. Bookmarks written before
+// Folder was always set count as unread.
+func (b Bookmark) InFolder(folder string) bool {
+	if b.Folder == "" {
+		return folder == Unread
+	}
+	return b.Folder == folder
 }
 
 // Host returns the bookmark's hostname with any leading "www." removed.
@@ -69,6 +88,16 @@ type Library struct {
 	Archived  []string             `json:"archived"`
 	LastBatch string               `json:"last_batch,omitempty"`
 
+	// Cursor is the `since` value for the next incremental sync: a unix time
+	// shortly before the last successful one started. Zero means no sync has
+	// completed under this schema, so the next one must be a full read.
+	Cursor int64 `json:"cursor,omitempty"`
+	// Synced lists the folders that have had a full read since Cursor was
+	// first set, and so are kept current by the change feed. A folder not in
+	// here has never been read whole and needs a full sync before the feed's
+	// deltas mean anything for it.
+	Synced []string `json:"synced_folders,omitempty"`
+
 	archived map[string]struct{} // index over Archived, built on load
 }
 
@@ -103,8 +132,56 @@ func Load(path string) (*Library, error) {
 		return nil, fmt.Errorf("%s was written by a newer samling (schema v%d, this build understands v%d)",
 			path, l.Version, Version)
 	}
+	if l.Version < 2 {
+		l.migrateV1()
+	}
 	l.normalize()
 	return &l, nil
+}
+
+// migrateV1 upgrades a schema-v1 library in memory; the next Save writes v2.
+//
+// The unread mirror, pending picks and tombstones all stay: ids did not change
+// between API versions. What goes is anything v2 sync can no longer maintain.
+// v1 could mirror the "starred" and "archive" pseudo-folders, which v2 sync
+// does not (starred is an attribute now, and archive is not a reading list),
+// so those entries would otherwise sit in the mirror forever, never refreshed
+// and never removed. The obsolete "hash" field is dropped by the decoder.
+func (l *Library) migrateV1() {
+	for id, b := range l.Bookmarks {
+		if b.Folder == "starred" || b.Folder == "archive" {
+			delete(l.Bookmarks, id)
+		}
+	}
+	l.Cursor = 0
+	l.Synced = nil
+}
+
+// IsSynced reports whether folder has had a full read that the change feed
+// has kept current since.
+func (l *Library) IsSynced(folder string) bool {
+	for _, f := range l.Synced {
+		if f == folder {
+			return true
+		}
+	}
+	return false
+}
+
+// MarkSynced records a completed full read of folder.
+func (l *Library) MarkSynced(folder string) {
+	if !l.IsSynced(folder) {
+		l.Synced = append(l.Synced, folder)
+		sort.Strings(l.Synced)
+	}
+}
+
+// Drop removes an article from the mirror and from the pending set without
+// tombstoning it: it is gone from Instapaper, or out of every mirrored folder,
+// so there is nothing left to archive and nothing to suppress.
+func (l *Library) Drop(id string) {
+	delete(l.Bookmarks, id)
+	delete(l.Read, id)
 }
 
 // Save writes the library atomically.
@@ -314,28 +391,6 @@ func (l *Library) PendingArchive() []ReadEntry {
 		return out[i].ID < out[j].ID
 	})
 	return out
-}
-
-// HaveParam builds the "have" value for bookmarks/list: the unread articles the
-// client already holds, with their hashes so the server can report metadata
-// changes.
-//
-// Pending-archive articles and tombstones are deliberately left out. Both are
-// ids we could suppress to save bandwidth, but seeing them is the whole point:
-// an article we plan to archive, or already archived, that still shows up in
-// Unread has been re-saved by hand, and Rescue needs to hear about it. The cost
-// is re-receiving a handful of pending articles each sync.
-func (l *Library) HaveParam() string {
-	parts := make([]string, 0, len(l.Bookmarks))
-	for id, b := range l.Bookmarks {
-		if b.Hash != "" {
-			parts = append(parts, id+":"+b.Hash)
-		} else {
-			parts = append(parts, id)
-		}
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, ",")
 }
 
 // Stats summarizes the library for `samling status`.

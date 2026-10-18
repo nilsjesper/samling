@@ -1,17 +1,18 @@
-// Package instapaper is a small typed client for the Instapaper Full API v1.
+// Package instapaper is a small typed client for the Instapaper API.
 //
-// Notes on the API that shape this code:
-//   - Every call is a POST with form-encoded parameters; OAuth goes in the
+// Everything samling reads or changes goes through API v2 (see v2.go): JSON
+// over GET/POST with a bearer token, real offset pagination, and a `since`
+// change feed. Only login still speaks the Full API v1, because its xAuth
+// exchange is how samling currently obtains a token -- and that token doubles
+// as a v2 bearer token, verified against the live API.
+//
+// Notes on v1 that shape the code in this file:
+//   - Every call is a POST with form-encoded parameters; OAuth 1.0a goes in the
 //     Authorization header.
 //   - Authentication is xAuth only: username + password -> access token. There
 //     is no request-token/authorize browser flow.
-//   - Most responses are a JSON array of typed objects. oauth/access_token
-//     answers in form-encoded text, and bookmarks/list is called at version 1.1
-//     because v1 returns an array that buries delete_ids on a "meta" element.
-//   - bookmarks/list caps at 500 per folder with no way to page further; see
-//     MaxListLimit.
-//   - Field types are inconsistent (starred arrives as "1" or 1), so scalars are
-//     decoded through the flexible types at the bottom of this file.
+//   - Responses are a JSON array of typed objects, except oauth/access_token,
+//     which answers in form-encoded text.
 //   - A response that is not valid JSON means "503, retry later" per the docs.
 package instapaper
 
@@ -23,7 +24,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,13 +33,6 @@ import (
 // BaseURL is the API root. Overridable per-client for tests.
 const BaseURL = "https://www.instapaper.com"
 
-// MaxListLimit is the largest number of items bookmarks/list will return, and
-// because the "have" parameter filters after the limit rather than before it,
-// this is also a hard ceiling on how far into a folder the API can see. There
-// is no offset parameter and no cursor. A folder with 5,000 articles will only
-// ever expose its newest 500 until some of them leave the folder.
-const MaxListLimit = 500
-
 // Client talks to the Instapaper API.
 type Client struct {
 	HTTP    *http.Client
@@ -47,7 +40,8 @@ type Client struct {
 	BaseURL string
 
 	// Retries is the number of extra attempts made for retryable failures
-	// (5xx responses and unparseable bodies). Zero means a single attempt.
+	// (network errors, 5xx and 429 responses, and unparseable bodies). Zero
+	// means a single attempt.
 	Retries int
 }
 
@@ -67,41 +61,13 @@ type User struct {
 	Username string `json:"username"`
 }
 
-// Folder is a user-created organizational folder.
-type Folder struct {
-	FolderID flexString `json:"folder_id"`
-	Title    string     `json:"title"`
-}
-
-// Bookmark is a saved article. These are the only fields the API returns; note
-// in particular that there is no word count, so reading-time filters are not
-// possible from bookmarks/list alone.
-type Bookmark struct {
-	BookmarkID        flexString `json:"bookmark_id"`
-	URL               string     `json:"url"`
-	Title             string     `json:"title"`
-	Description       string     `json:"description"`
-	Hash              string     `json:"hash"`
-	Time              flexInt    `json:"time"`
-	Progress          flexFloat  `json:"progress"`
-	ProgressTimestamp flexInt    `json:"progress_timestamp"`
-	Starred           flexBool   `json:"starred"`
-	PrivateSource     string     `json:"private_source"`
-}
-
-// ListResult is the (non-standard) shape returned by bookmarks/list.
-type ListResult struct {
-	User      User         `json:"user"`
-	Bookmarks []Bookmark   `json:"bookmarks"`
-	DeleteIDs []flexString `json:"delete_ids"`
-}
-
 // ErrUnauthorized reports an HTTP 401. What that means depends on the call: on
 // the xAuth endpoint it is a bad username or password, and everywhere else it
 // is a token that is no longer good, so callers phrase it themselves.
 var ErrUnauthorized = errors.New("unauthorized")
 
-// APIError is a typed error object returned by the API.
+// APIError is an error the API described in its response body. For v1 Code is
+// the numeric error_code; for v2 it mirrors the HTTP status.
 type APIError struct {
 	Code    int
 	Message string
@@ -154,58 +120,6 @@ func (c *Client) VerifyCredentials(ctx context.Context) (User, error) {
 	return users[0], nil
 }
 
-// List fetches bookmarks from a folder. folder is "unread", "starred",
-// "archive", or a numeric folder id.
-//
-// Two things about this endpoint are not obvious from the docs and were
-// established by probing the live API:
-//
-//   - Version 1 answers with an array of typed objects and hides delete_ids as
-//     a comma-separated string on a "meta" element. Version 1.1 answers with
-//     the documented object. This uses 1.1.
-//   - have is a de-duplication filter, NOT pagination. The server takes the
-//     first `limit` items of the folder and then subtracts have, so a folder
-//     can never be read past `limit`. See MaxListLimit.
-func (c *Client) List(ctx context.Context, folder string, limit int, have string) (*ListResult, error) {
-	if limit <= 0 || limit > MaxListLimit {
-		limit = MaxListLimit
-	}
-	params := url.Values{
-		"limit":     {strconv.Itoa(limit)},
-		"folder_id": {folder},
-	}
-	if have != "" {
-		params.Set("have", have)
-	}
-	var out ListResult
-	if err := c.call(ctx, "/api/1.1/bookmarks/list", params, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// Archive moves a bookmark to the Archive folder. This is not a delete: the
-// article stays in the account and remains searchable.
-func (c *Client) Archive(ctx context.Context, bookmarkID string) error {
-	return c.call(ctx, "/api/1/bookmarks/archive",
-		url.Values{"bookmark_id": {bookmarkID}}, nil)
-}
-
-// Unarchive moves a bookmark back to the top of Unread.
-func (c *Client) Unarchive(ctx context.Context, bookmarkID string) error {
-	return c.call(ctx, "/api/1/bookmarks/unarchive",
-		url.Values{"bookmark_id": {bookmarkID}}, nil)
-}
-
-// Folders lists the account's user-created folders.
-func (c *Client) Folders(ctx context.Context) ([]Folder, error) {
-	var folders []Folder
-	if err := c.call(ctx, "/api/1/folders/list", nil, &folders); err != nil {
-		return nil, err
-	}
-	return folders, nil
-}
-
 // call POSTs to an endpoint and decodes the JSON response into out, which may
 // be nil when the caller does not care about the body.
 func (c *Client) call(ctx context.Context, path string, params url.Values, out any) error {
@@ -237,18 +151,30 @@ func (c *Client) raw(ctx context.Context, path string, params url.Values, wantJS
 		params = url.Values{}
 	}
 	endpoint := strings.TrimSuffix(c.baseURL(), "/") + path
+	return c.withRetries(ctx, func() ([]byte, error) {
+		return c.attempt(ctx, endpoint, params, wantJSON)
+	})
+}
 
+// withRetries makes one attempt and repeats it with exponential backoff for as
+// long as it fails retryably and the budget lasts. Both API versions go
+// through here, so they back off identically.
+func (c *Client) withRetries(ctx context.Context, attempt func() ([]byte, error)) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			delay := time.Duration(1<<uint(attempt-1)) * time.Second
+	for i := 0; i <= c.Retries; i++ {
+		if i > 0 {
+			delay := time.Duration(1<<uint(i-1)) * time.Second
+			var r *retryableError
+			if errors.As(lastErr, &r) && r.after > delay {
+				delay = min(r.after, maxRetryAfter)
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
-		body, err := c.attempt(ctx, endpoint, params, wantJSON)
+		body, err := attempt()
 		if err == nil {
 			return body, nil
 		}
@@ -277,18 +203,18 @@ func (c *Client) attempt(ctx context.Context, endpoint string, params url.Values
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, &retryableError{err}
+		return nil, &retryableError{err: err}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, &retryableError{err}
+		return nil, &retryableError{err: err}
 	}
 
 	switch {
 	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
-		return nil, &retryableError{fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))}
+		return nil, &retryableError{err: fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))}
 	case resp.StatusCode == http.StatusUnauthorized:
 		return nil, fmt.Errorf("%w (HTTP 401)", ErrUnauthorized)
 	case resp.StatusCode >= 400:
@@ -299,7 +225,7 @@ func (c *Client) attempt(ctx context.Context, endpoint string, params url.Values
 	}
 
 	if wantJSON && !json.Valid(body) {
-		return nil, &retryableError{fmt.Errorf("malformed response: %s", truncate(string(body), 200))}
+		return nil, &retryableError{err: fmt.Errorf("malformed response: %s", truncate(string(body), 200))}
 	}
 	return body, nil
 }
@@ -341,7 +267,15 @@ func apiError(body []byte) error {
 	return nil
 }
 
-type retryableError struct{ err error }
+// retryableError marks a failure worth trying again. after, when set, is how
+// long the server asked us to wait (a 429's Retry-After).
+type retryableError struct {
+	err   error
+	after time.Duration
+}
+
+// maxRetryAfter caps how long a Retry-After can stall a sync per attempt.
+const maxRetryAfter = time.Minute
 
 func (e *retryableError) Error() string { return e.err.Error() }
 func (e *retryableError) Unwrap() error { return e.err }
@@ -358,80 +292,3 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
-
-// --- flexible scalar decoding -------------------------------------------------
-//
-// Instapaper is inconsistent about whether numbers and booleans arrive as JSON
-// scalars or as strings, so every scalar field goes through one of these.
-
-type flexString string
-
-func (f *flexString) UnmarshalJSON(b []byte) error {
-	s := string(b)
-	if s == "null" {
-		*f = ""
-		return nil
-	}
-	if len(b) > 0 && b[0] == '"' {
-		var v string
-		if err := json.Unmarshal(b, &v); err != nil {
-			return err
-		}
-		*f = flexString(v)
-		return nil
-	}
-	*f = flexString(strings.TrimSuffix(s, ".0"))
-	return nil
-}
-
-func (f flexString) String() string { return string(f) }
-
-type flexInt int64
-
-func (f *flexInt) UnmarshalJSON(b []byte) error {
-	s := strings.Trim(string(b), `"`)
-	if s == "" || s == "null" {
-		*f = 0
-		return nil
-	}
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return fmt.Errorf("expected a number, got %s", string(b))
-	}
-	*f = flexInt(int64(v))
-	return nil
-}
-
-func (f flexInt) Int64() int64 { return int64(f) }
-
-type flexFloat float64
-
-func (f *flexFloat) UnmarshalJSON(b []byte) error {
-	s := strings.Trim(string(b), `"`)
-	if s == "" || s == "null" {
-		*f = 0
-		return nil
-	}
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return fmt.Errorf("expected a number, got %s", string(b))
-	}
-	*f = flexFloat(v)
-	return nil
-}
-
-func (f flexFloat) Float64() float64 { return float64(f) }
-
-type flexBool bool
-
-func (f *flexBool) UnmarshalJSON(b []byte) error {
-	switch s := strings.Trim(string(b), `"`); s {
-	case "", "null", "0", "false", "0.0":
-		*f = false
-	default:
-		*f = true
-	}
-	return nil
-}
-
-func (f flexBool) Bool() bool { return bool(f) }

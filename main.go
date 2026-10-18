@@ -98,8 +98,9 @@ Pick and list flags:
                      are never going to read (use 'list' to preview instead)
 
 Sync flags:
-  --folder NAME      Instapaper folder to mirror: unread (default), starred,
-                     archive, or a numeric id from 'samling folders'
+  --folder NAME      Instapaper folder to mirror: unread (default) or a
+                     numeric id from 'samling folders'
+  --full             Re-read the whole folder, not just what changed
   --dry-run          Report what would happen without changing anything
   --concurrency N    Parallel archive requests (default 4)
 
@@ -108,7 +109,7 @@ The triage loop:
                          close the ones you do not care about
                          re-save the keepers with the Instapaper extension
   samling sync           archives the rest; re-saved keepers are detected
-                         and kept, and older articles slide into view
+                         and kept
 
 Setup:
   1. Request an API consumer key at
@@ -373,11 +374,11 @@ func cmdFolders(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("unread    (built in)")
-	fmt.Println("starred   (built in)")
-	fmt.Println("archive   (built in)")
+	// Only folders samling can mirror are listed. Starred and archive used to
+	// be here as v1 pseudo-folders; v2 sync takes neither.
+	fmt.Printf("%-10s %7s  %s\n", "unread", "", "(built in)")
 	for _, f := range folders {
-		fmt.Printf("%-9s %s\n", f.FolderID, f.Title)
+		fmt.Printf("%-10d %7s  %s\n", f.ID, comma(f.Count), f.Title)
 	}
 	return nil
 }
