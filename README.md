@@ -149,23 +149,30 @@ samling undo
 That only works before the next `sync`. Once an article has actually been
 archived in Instapaper, unarchive it there.
 
-## Reaching a deep backlog
+## How sync works
 
-The API will not show you more than the newest 500 unread articles, and there is
-no parameter that changes that. If your backlog is larger, samling can't see all
-of it at once — nothing can, through this API.
+The first sync reads your whole Unread list, however long it is, a page of 500
+at a time:
 
-What it does instead is accumulate. `library.json` is never wiped; each sync
-adds whatever is newly visible. Since archiving removes an article from Unread,
-every article you read slides one more into the window:
-
-```sh
-samling pick 5        # read five
-samling sync          # archives them; five older ones become visible
+```
+$ samling sync
+Reading all of unread...
+  add 23,371 new articles, refresh 487, drop 7 articles no longer in unread
 ```
 
-So the mirror grows as you work through it, and `status` will show the total
-climbing past 500 over time.
+After that, a sync asks Instapaper only for what changed since the last one,
+which usually takes a single request. New saves come in; articles you archived,
+deleted or moved to another folder elsewhere drop out; a pick you already
+archived from your phone is simply forgotten, with no request sent.
+
+`samling sync --full` re-reads the whole folder. You shouldn't need it, but it
+is the cure if the mirror ever seems out of step: a full read is a snapshot, so
+anything it doesn't return is removed from the mirror.
+
+`samling sync --folder 1234567` mirrors one of your own folders as well (ids
+from `samling folders`), and `pick --folder 1234567` picks from it. Every
+folder synced this way stays current from then on, whichever one you name.
+Starred isn't a folder (use `pick --starred`), and the Archive isn't mirrored.
 
 ## Files
 
@@ -175,7 +182,7 @@ Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
 |---|---|
 | `config.json` | Your consumer key and secret |
 | `token.json` | The OAuth access token (mode `0600`) |
-| `library.json` | The local mirror: unread, pending-archive, and tombstones |
+| `library.json` | The local mirror: unread, pending-archive, tombstones, and the sync cursor |
 
 `library.json` is plain JSON and safe to read, grep, or back up. Writes are
 atomic, so an interrupted run can't corrupt it.
@@ -184,42 +191,40 @@ atomic, so an interrupted run can't corrupt it.
 
 Things worth knowing if you plan to hack on this:
 
-- **xAuth only.** There is no request-token/authorize browser flow. OAuth 1.0a
-  with HMAC-SHA1, parameters in the `Authorization` header, everything POSTed.
-- **500 per folder, and no way past it.** `bookmarks/list` has no offset and no
-  cursor. The `have` parameter looks like pagination but isn't: the server takes
-  the first `limit` items of the folder and *then* subtracts `have`, so asking
-  again with everything you hold returns nothing rather than the next page.
-  Verified against the live API. A folder with 5,000 articles will only ever
-  expose its newest 500.
-
-  This is why samling's mirror is **cumulative** rather than a snapshot.
-  Archiving an article removes it from Unread, which slides the window, so each
-  sync uncovers a little more of the backlog. See "Reaching a deep backlog".
-- **`bookmarks/list` is called at v1.1.** The v1 endpoint returns an array of
-  typed objects and buries `delete_ids` as a comma-separated string on a `meta`
-  element; v1.1 returns the documented object with `delete_ids` as an array.
-- **`delete_ids` reports what fell outside the *window*, not what was deleted.**
-  An article still in your account but sitting below the 500-item cut comes back
-  as a `delete_id`, indistinguishable from a genuine deletion. samling therefore
-  acts on it only when everything it knows about fits inside the window with room
-  to spare. An earlier version trusted it at exactly 500 and a single re-saved
-  article — rejoining the top of Unread and displacing the last one — evicted a
-  live article from the mirror. Worst case now, a real deletion is noticed later.
-- **Re-saving reuses the `bookmark_id`** and refreshes the article's `time`.
+- **Two API versions.** Sync, archiving and `folders` use API v2 (`/api/2/`):
+  JSON, `GET` for reads, and the access token as a plain
+  `Authorization: Bearer` header. `login` still uses v1's xAuth, an OAuth 1.0a
+  exchange of username and password for a token. That v1 token works unchanged
+  as a v2 bearer token (verified live); its secret goes unused.
+- **v1 couldn't see past 500.** v1's `bookmarks/list` read only the newest 500
+  articles of a folder and had no offset. Its `have` parameter looked like
+  pagination but filtered *after* the limit was applied. On a 23,858-article
+  backlog, samling's mirror held 494 of them. v2 has real `offset` paging and
+  reports the section's `total`.
+- **The `since` feed is account-wide.** `GET /api/2/bookmarks?since=T` returns
+  every bookmark changed after `T` in any section, archived ones included
+  (`archived: true`), plus `deleted_ids`. A tag-only change shows up too, with
+  `time` unchanged. Bookmarks and deleted ids share each page's `limit`, so the
+  offset advances by both. samling stores the time just *before* each sync
+  started, minus ten minutes for clock skew, as the next `since`. Reading a
+  change twice is harmless; missing one is not.
+- **Re-saving reuses the bookmark id** and refreshes the article's `time`.
   That timestamp is the only way to tell "I re-saved this during triage" from
   "this is still queued for archiving", which is why `sync` fetches before it
-  archives.
-- **`have` gets big.** Roughly 9 bytes per article, so a 20,000-item backlog
-  means a ~180 KB POST body. `sync` warns past 100 KB. If Instapaper ever starts
-  rejecting those, that's the reason.
-- **No bulk actions.** Unlike Pocket, archiving is one request per article, so
-  `sync` uses a small worker pool (`--concurrency`, default 4) and saves
-  progress as it goes.
-- **No word count.** The bookmark object is only `bookmark_id, url, title,
-  description, hash, time, progress, progress_timestamp, starred,
-  private_source`. Reading-time filters would need a `bookmarks/get_text` fetch
-  per article; not implemented.
+  archives. (v2 `id` is the same number as v1 `bookmark_id`, so libraries from
+  older versions of samling carry straight over.)
+- **Offset paging isn't a snapshot.** If an article leaves Unread while a full
+  read is paging through it, everything shifts up one place and one article is
+  skipped, and dropped from the mirror until the next `sync --full`. It takes
+  about 48 requests to read 24,000 articles, so the window for this is small.
+- **No bulk actions.** Unlike Pocket, archiving is one request per article
+  (`POST /api/2/bookmarks/{id}/move`), so `sync` uses a small worker pool
+  (`--concurrency`, default 4) and saves progress as it goes.
+- **Errors are real HTTP statuses** with `{"error": {"code", "message"}}`.
+  samling retries 5xx, 429 (honouring `Retry-After`, capped at a minute), and
+  bodies that aren't JSON, which is how a maintenance page shows up.
+- **No word count** in the bookmark object. Reading-time filters would need a
+  `GET /api/2/bookmarks/{id}/parse` per article; not implemented.
 
 ## Development
 
@@ -228,10 +233,11 @@ go test ./...
 go vet ./...
 ```
 
-The tests cover the two things most likely to break silently: the OAuth 1.0a
-signature (checked against the worked example in RFC 5849 §3.4.1.1) and the
-drain loop's paging and `delete_ids` handling (checked against a fake server,
-including a deliberately hostile one that reports spurious deletions).
+The tests cover the things most likely to break silently: the OAuth 1.0a
+signature (checked against the worked example in RFC 5849 §3.4.1.1), and sync
+against a fake v2 server. That includes paging, the change feed and its
+deletions, re-saved keepers, picks archived elsewhere, migrating a v1 library,
+and the cursor advancing only after a successful sync.
 
 ## Name
 
