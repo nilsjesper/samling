@@ -74,7 +74,7 @@ Usage:
   samling <command> [flags]
 
 Commands:
-  login     Exchange your Instapaper username and password for an access token
+  login     Sign in to Instapaper and save an access token
   sync      Archive what you've read, then refresh the local unread mirror
   pick N    Open N random unread articles and mark them read locally
   list N    Same selection as pick, printed instead of opened
@@ -97,6 +97,18 @@ Pick and list flags:
   --no-open          Mark read without opening tabs — burn down a chunk you
                      are never going to read (use 'list' to preview instead)
 
+Login flags:
+  (none)             Sign in through your browser (OAuth 2). Needs
+                     http://127.0.0.1:8919/callback registered as a callback
+                     URI on your application's page
+  --port N           Use another loopback port (register its URI instead)
+  --no-open          Print the sign-in URL instead of opening a browser
+  --token            Save a token from "Generate access token" on your
+                     application's page; read from stdin or a hidden prompt
+  --password         Deprecated xAuth username/password exchange. Instapaper
+                     turns it off for new sign-ins on 2027-09-30
+  --username NAME    With --password: skip the username prompt
+
 Sync flags:
   --folder NAME      Instapaper folder to mirror: unread (default) or a
                      numeric id from 'samling folders'
@@ -116,69 +128,14 @@ Setup:
      https://www.instapaper.com/developers/applications/create
   2. Put it in ~/.samling/config.json as {"consumer_key":"...","consumer_secret":"..."}
      or set INSTAPAPER_CONSUMER_KEY / INSTAPAPER_CONSUMER_SECRET
-  3. samling login && samling sync && samling pick 3
+  3. Either register http://127.0.0.1:8919/callback as a callback URI on the
+     application's page, or generate an access token there and use
+     samling login --token
+  4. samling login && samling sync && samling pick 3
 
 State lives in ~/.samling (override with SAMLING_HOME).
 Picking is entirely offline; only 'sync', 'login' and 'folders' touch the network.
 `)
-}
-
-// --- login --------------------------------------------------------------------
-
-func cmdLogin(args []string) error {
-	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	username := fs.String("username", "", "Instapaper username or email (prompted if omitted)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		return err
-	}
-
-	user := *username
-	if user == "" {
-		if user, err = prompt("Instapaper username or email: "); err != nil {
-			return err
-		}
-	}
-	password, err := promptPassword("Password (leave blank if your account has none): ")
-	if err != nil {
-		return err
-	}
-
-	ctx, stop := signalContext()
-	defer stop()
-
-	client := instapaper.New(oauth1.Credentials{
-		ConsumerKey:    cfg.ConsumerKey,
-		ConsumerSecret: cfg.ConsumerSecret,
-	})
-
-	token, secret, err := client.AccessToken(ctx, user, password)
-	if err != nil {
-		return err
-	}
-	client.Creds.Token, client.Creds.TokenSecret = token, secret
-
-	account, err := client.VerifyCredentials(ctx)
-	if err != nil {
-		return fmt.Errorf("got a token but could not verify it: %w", err)
-	}
-
-	if err := config.SaveToken(config.Token{
-		Token:       token,
-		TokenSecret: secret,
-		UserID:      account.UserID,
-		Username:    account.Username,
-	}); err != nil {
-		return err
-	}
-
-	fmt.Printf("Logged in as %s (user %d).\nToken saved to %s\nNext: samling sync\n",
-		account.Username, account.UserID, config.Path("token.json"))
-	return nil
 }
 
 // --- pick / list ----------------------------------------------------------------
