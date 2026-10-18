@@ -36,7 +36,7 @@ func reSaveAtNewAddresses(fake *fakeInstapaper) {
 func TestReSaveAtANewAddressIsKept(t *testing.T) {
 	fake := newFakeServer(0)
 	seedRedirectedPicks(fake)
-	fake.tag(harvardOld, "samling2")
+	fake.tag(harvardOld, "ifttt", "samling2")
 	client := newFake(t, fake)
 	path := filepath.Join(t.TempDir(), "library.json")
 	ctx := context.Background()
@@ -72,8 +72,93 @@ func TestReSaveAtANewAddressIsKept(t *testing.T) {
 	if got := lib.Bookmarks[harvardNew].Kept(); got != 3 {
 		t.Errorf("mirror shows the harvard copy kept ×%d, want 3", got)
 	}
-	if len(lib.PendingKept) != 0 {
-		t.Errorf("tag queue = %v", lib.PendingKept)
+	if len(lib.PendingKept) != 0 || len(lib.PendingUntag) != 0 {
+		t.Errorf("tag queues = %v, %v", lib.PendingKept, lib.PendingUntag)
+	}
+	// The count moved, so the old copy loses its samlingN and nothing else.
+	if got := fmt.Sprint(fake.articles[harvardOld].tags); got != "[ifttt]" {
+		t.Errorf("harvard old copy tags = %s, want [ifttt]", got)
+	}
+}
+
+// Taking samlingN off an old copy follows the same retry rules: a failure is
+// queued, survives the old copy being archived, and is applied once later.
+func TestOldCopyUntagIsRetried(t *testing.T) {
+	fake := newFakeServer(0)
+	seedRedirectedPicks(fake)
+	fake.tag(harvardOld, "ifttt", "samling2")
+	client := newFake(t, fake)
+	path := filepath.Join(t.TempDir(), "library.json")
+	ctx := context.Background()
+
+	lib := library.New()
+	mustDrain(t, client, lib, unread)
+	lib.MarkRead([]library.Bookmark{lib.Bookmarks[harvardOld]}, time.Now().Add(-time.Hour))
+
+	reSaveAtNewAddresses(fake)
+	fake.failTags = true
+	mustDrain(t, client, lib, unread)
+	mustMarkKept(t, client, lib, false)
+	if err := archivePending(ctx, client, lib, path, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(lib.PendingUntag); got != "map["+harvardOld+":[samling2]]" {
+		t.Fatalf("untag queue = %s", got)
+	}
+	if !lib.IsArchived(harvardOld) {
+		t.Fatal("a failed untag held up archiving the old copy")
+	}
+
+	fake.failTags = false
+	mustDrain(t, client, lib, unread)
+	mustMarkKept(t, client, lib, false)
+	mustDrain(t, client, lib, unread)
+	mustMarkKept(t, client, lib, false)
+
+	var untags int
+	for _, w := range fake.tagWrites {
+		if w.id == harvardOld {
+			untags++
+			if len(w.add) != 0 || fmt.Sprint(w.remove) != fmt.Sprint([]int64{fake.tagIDs["samling2"]}) {
+				t.Errorf("old copy write = %+v, want only samling2 removed", w)
+			}
+		}
+	}
+	if untags != 1 {
+		t.Errorf("untagged the old copy %d times, want 1", untags)
+	}
+	if got := fmt.Sprint(fake.articles[harvardOld].tags); got != "[ifttt]" {
+		t.Errorf("old copy tags = %s, want [ifttt]", got)
+	}
+	if got := fmt.Sprint(fake.articles[harvardNew].tags); got != "[samling3]" {
+		t.Errorf("new copy tags = %s, want [samling3]", got)
+	}
+	if len(lib.PendingKept) != 0 || len(lib.PendingUntag) != 0 {
+		t.Errorf("tag queues = %v, %v", lib.PendingKept, lib.PendingUntag)
+	}
+}
+
+// An ordinary pick that is archived keeps its samlingN: it survived earlier
+// triages, and that stays on record.
+func TestArchivedPickKeepsItsCount(t *testing.T) {
+	fake := newFakeServer(2)
+	fake.tag("1", "samling2")
+	client := newFake(t, fake)
+	path := filepath.Join(t.TempDir(), "library.json")
+	lib := library.New()
+	mustDrain(t, client, lib, unread)
+	lib.MarkRead([]library.Bookmark{lib.Bookmarks["1"]}, time.Now().Add(-time.Hour))
+
+	mustDrain(t, client, lib, unread)
+	mustMarkKept(t, client, lib, false)
+	if err := archivePending(context.Background(), client, lib, path, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if !lib.IsArchived("1") || len(fake.tagWrites) != 0 {
+		t.Errorf("archived %v, tag writes %+v", lib.IsArchived("1"), fake.tagWrites)
+	}
+	if got := fmt.Sprint(fake.articles["1"].tags); got != "[samling2]" {
+		t.Errorf("tags = %s", got)
 	}
 }
 

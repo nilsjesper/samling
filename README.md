@@ -67,7 +67,8 @@ Each keeper also gets a counter tag in Instapaper: `samling1` the first time
 you keep it, then `samling2`, `samling3` and so on, swapped in place so an
 article only ever has one. Click `samling4` in Instapaper to see everything
 that survived four triages. A keeper that came back at a new address carries
-its count over to the new copy. Kept articles stay in the pick pool, and `pick`,
+its count over to the new copy, and the archived old copy loses its
+`samlingN` (only that tag), so each survivor shows up once. Kept articles stay in the pick pool, and `pick`,
 `list` and `status` show the count (`kept ×3`). Tagging doesn't change an
 article's save time or its place in Unread. If a tag write fails, `sync` says
 so, carries on, and retries it next time.

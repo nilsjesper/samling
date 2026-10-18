@@ -140,6 +140,11 @@ type Library struct {
 	// schema version stays at 2: a build that predates it just drops the queue
 	// and leaves those tags unwritten.
 	PendingKept map[string]int `json:"pending_kept,omitempty"`
+	// PendingUntag maps the old copy of a keeper that came back at a new
+	// address to the samlingN tags still to remove from it, now that its
+	// count lives on the new copy. Names rather than the mirror's tags,
+	// because the old copy is archived and leaves the mirror.
+	PendingUntag map[string][]string `json:"pending_untag,omitempty"`
 
 	archived map[string]struct{} // index over Archived, built on load
 }
@@ -355,6 +360,22 @@ func (l *Library) KeptDone(id string) {
 	delete(l.PendingKept, id)
 	if len(l.PendingKept) == 0 {
 		l.PendingKept = nil
+	}
+}
+
+// QueueUntag records samlingN tags to remove from an article.
+func (l *Library) QueueUntag(id string, tags []string) {
+	if l.PendingUntag == nil {
+		l.PendingUntag = map[string][]string{}
+	}
+	l.PendingUntag[id] = tags
+}
+
+// UntagDone clears an article from the untag queue.
+func (l *Library) UntagDone(id string) {
+	delete(l.PendingUntag, id)
+	if len(l.PendingUntag) == 0 {
+		l.PendingUntag = nil
 	}
 }
 

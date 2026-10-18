@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,7 +200,9 @@ feed:
 }
 
 // markKept writes the samlingN tags that rescues queued, so that clicking
-// samling4 in Instapaper shows everything kept through four triages.
+// samling4 in Instapaper shows everything kept through four triages. It also
+// takes the samlingN off the old copy of a keeper that came back at a new
+// address, so the survivor isn't listed twice under its tag.
 //
 // It runs after the drain plan is applied, so each article's tags are as fresh
 // as this sync can make them. A failed write is reported and stays queued for
@@ -223,21 +227,36 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 			lib.KeptDone(id)
 		}
 	}
-	if len(todo) == 0 {
+	var untag []string
+	for id := range lib.PendingUntag {
+		untag = append(untag, id)
+	}
+	if len(todo) == 0 && len(untag) == 0 {
 		return nil
 	}
 	sort.Strings(todo)
+	sort.Strings(untag)
 
 	if dryRun {
-		fmt.Printf("Would retry marking %s as kept:\n", plural(len(todo), "article", "articles"))
+		if len(todo) > 0 {
+			fmt.Printf("Would retry marking %s as kept:\n", plural(len(todo), "article", "articles"))
+		}
 		for _, id := range todo {
 			b, _ := lib.Entry(id)
 			fmt.Printf("  %s · %s\n", titleOf(b), keptTimes(lib.PendingKept[id]))
 		}
+		for _, id := range untag {
+			fmt.Printf("Would remove %s from %s, the old copy of a keeper\n",
+				strings.Join(lib.PendingUntag[id], ", "), id)
+		}
 		return nil
 	}
 
-	fmt.Printf("Marking %s as kept...\n", plural(len(todo), "article", "articles"))
+	if len(todo) > 0 {
+		fmt.Printf("Marking %s as kept...\n", plural(len(todo), "article", "articles"))
+	} else {
+		fmt.Println("Updating samling tags...")
+	}
 
 	// Tag ids are only needed to remove an old samlingN, so a sync whose
 	// rescues are all first-timers never asks for them.
@@ -295,6 +314,51 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 		lib.SetTags(id, names)
 		lib.KeptDone(id)
 		done++
+	}
+
+	// Old copies of keepers that came back at a new address: their samlingN
+	// moved to the new copy, so it comes off here and each survivor appears
+	// once under its tag. Only these copies lose a tag; an ordinary archived
+	// pick keeps whatever it had. The names are queued rather than read from
+	// the mirror because the old copy leaves it once archived.
+	for _, id := range untag {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lookup, err := tagIDs()
+		if err != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "  could not untag old copy %s: %v\n", id, err)
+			continue
+		}
+		var remove []int64
+		for _, name := range lib.PendingUntag[id] {
+			if tid, ok := lookup[name]; ok {
+				remove = append(remove, tid)
+			}
+		}
+		if len(remove) > 0 {
+			_, err := client.TagBookmark(ctx, id, nil, remove)
+			var apiErr *instapaper.APIError
+			switch {
+			case errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound:
+				// Deleted since: nothing left to untag.
+			case err != nil:
+				failed++
+				fmt.Fprintf(os.Stderr, "  could not untag old copy %s: %v\n", id, err)
+				continue
+			}
+		}
+		if e, ok := lib.Pending(id); ok {
+			var left []string
+			for _, t := range e.Tags {
+				if _, kept := library.KeptCount(t); !kept {
+					left = append(left, t)
+				}
+			}
+			lib.SetTags(id, left)
+		}
+		lib.UntagDone(id)
 	}
 
 	fmt.Printf("  marked %d", done)
@@ -619,6 +683,15 @@ func finish(lib *library.Library, p *plan, dryRun bool) {
 		// The count now lives on the new copy; the old one is archived as
 		// usual, so a tag still queued for it would only be dropped later.
 		lib.KeptDone(m.old.ID)
+		var counters []string
+		for _, t := range m.old.Tags {
+			if _, ok := library.KeptCount(t); ok {
+				counters = append(counters, t)
+			}
+		}
+		if len(counters) > 0 {
+			lib.QueueUntag(m.old.ID, counters)
+		}
 	}
 	for _, id := range p.gone {
 		lib.Drop(id)
