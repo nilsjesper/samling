@@ -121,7 +121,8 @@ The triage loop:
                          close the ones you do not care about
                          re-save the keepers with the Instapaper extension
   samling sync           archives the rest; re-saved keepers are detected
-                         and kept
+                         and kept, and tagged samling1, samling2, ...
+                         for each time you keep them
 
 Setup:
   1. Request an API consumer key at
@@ -280,6 +281,12 @@ func cmdStatus(args []string) error {
 		fmt.Println("\nTop domains:")
 		for _, d := range s.Domains {
 			fmt.Printf("  %5s  %s\n", comma(d.Count), d.Host)
+		}
+	}
+	if kept := lib.MostKept(5); len(kept) > 0 {
+		fmt.Println("\nMost re-saved:")
+		for _, b := range kept {
+			fmt.Printf("  %5s  %s\n", fmt.Sprintf("×%d", b.Kept()), titleOf(b))
 		}
 	}
 	return nil
@@ -458,6 +465,9 @@ func describe(b library.Bookmark) string {
 	}
 	if b.Progress > 0.01 {
 		parts = append(parts, fmt.Sprintf("%.0f%% read", b.Progress*100))
+	}
+	if n := b.Kept(); n > 0 {
+		parts = append(parts, keptTimes(n))
 	}
 	return strings.Join(parts, " · ")
 }

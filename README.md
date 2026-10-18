@@ -54,6 +54,14 @@ article's `bookmark_id`, so without that detection your keepers would be
 archived by the very sync that follows, or stay tombstoned and never be served
 again. A deliberate re-save always outranks samling's bookkeeping.
 
+Each keeper also gets a counter tag in Instapaper: `samling1` the first time
+you keep it, then `samling2`, `samling3` and so on, swapped in place so an
+article only ever has one. Click `samling4` in Instapaper to see everything
+that survived four triages. Kept articles stay in the pick pool, and `pick`,
+`list` and `status` show the count (`kept ×3`). Tagging doesn't change an
+article's save time or its place in Unread. If a tag write fails, `sync` says
+so, carries on, and retries it next time.
+
 To burn down a chunk you're never going to read, skip the browser entirely:
 
 ```sh
@@ -137,7 +145,7 @@ in again.
 | `samling pick N` | Open N random unread articles, mark them read locally |
 | `samling pick N --no-open` | Same, without tabs — bulk-skip a chunk |
 | `samling list N` | Same selection as `pick`, printed instead of opened |
-| `samling status` | Unread / pending / archived counts, top domains, oldest article |
+| `samling status` | Unread / pending / archived counts, top domains, oldest article, most re-saved |
 | `samling undo` | Put the most recent pick back (before the next sync) |
 | `samling folders` | List your Instapaper folder ids |
 
@@ -238,6 +246,14 @@ Things worth knowing if you plan to hack on this:
   read is paging through it, everything shifts up one place and one article is
   skipped, and dropped from the mirror until the next `sync --full`. It takes
   about 48 requests to read 24,000 articles, so the window for this is small.
+- **Tags are swapped by id.** `POST /api/2/bookmarks/{id}/tags` takes
+  `add_tags` by name (creating a tag that doesn't exist yet) and `remove_tags`
+  by id only, in one request, and answers with the article's full tag list.
+  The mirror stores tag names, so when an old `samlingN` has to come off, sync
+  reads `GET /api/2/tags` once to find its id. Tagging leaves `time` alone, and
+  tags survive a re-save from the browser extension (both verified live).
+  There's no endpoint for deleting a tag, so an old `samlingN` nobody carries
+  any more lingers in the tag list until you remove it in the web app.
 - **No bulk actions.** Unlike Pocket, archiving is one request per article
   (`POST /api/2/bookmarks/{id}/move`), so `sync` uses a small worker pool
   (`--concurrency`, default 4) and saves progress as it goes.
@@ -257,8 +273,9 @@ go vet ./...
 The tests cover the things most likely to break silently: the OAuth 1.0a
 signature (checked against the worked example in RFC 5849 §3.4.1.1), and sync
 against a fake v2 server. That includes paging, the change feed and its
-deletions, re-saved keepers, picks archived elsewhere, migrating a v1 library,
-and the cursor advancing only after a successful sync.
+deletions, re-saved keepers and their `samlingN` counters, picks archived
+elsewhere, migrating a v1 library, and the cursor advancing only after a
+successful sync.
 
 ## Name
 

@@ -236,6 +236,58 @@ func TestV2MoveSendsJSONBody(t *testing.T) {
 	}
 }
 
+// The swap the live API accepted: add by name, remove by id, in one body.
+func TestV2TagBookmarkSwapsInOneRequest(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/2/bookmarks/42/tags" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		if want := `{"add_tags":[{"name":"samling3"}],"remove_tags":[{"id":4220559}]}`; string(b) != want {
+			t.Errorf("body = %s, want %s", b, want)
+		}
+		w.Write([]byte(`{"created_tags":[{"id":4220560,"name":"samling3","slug":"samling3","count":1}],` +
+			`"tags":[{"id":7,"name":"ifttt","slug":"ifttt","count":15},{"id":4220560,"name":"samling3","slug":"samling3","count":1}]}`))
+	})
+	tags, err := c.TagBookmark(context.Background(), "42", []string{"samling3"}, []int64{4220559})
+	if err != nil {
+		t.Fatalf("TagBookmark: %v", err)
+	}
+	if len(tags) != 2 || tags[0].Name != "ifttt" || tags[1].Name != "samling3" || tags[1].ID != 4220560 {
+		t.Errorf("returned %+v, want the full tag list afterwards", tags)
+	}
+}
+
+// With nothing to remove, remove_tags is left out rather than sent empty.
+func TestV2TagBookmarkOmitsAnEmptySide(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if want := `{"add_tags":[{"name":"samling1"}]}`; string(b) != want {
+			t.Errorf("body = %s, want %s", b, want)
+		}
+		w.Write([]byte(`{"created_tags":[],"tags":[{"id":1,"name":"samling1","slug":"samling1","count":3}]}`))
+	})
+	if _, err := c.TagBookmark(context.Background(), "42", []string{"samling1"}, nil); err != nil {
+		t.Fatalf("TagBookmark: %v", err)
+	}
+}
+
+func TestV2Tags(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/2/tags" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		w.Write([]byte(`{"tags":[{"id":4220559,"name":"samling2","slug":"samling2","count":4,"baton":null}]}`))
+	})
+	tags, err := c.Tags(context.Background())
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+	}
+	if len(tags) != 1 || tags[0].ID != 4220559 || tags[0].Name != "samling2" || tags[0].Count != 4 {
+		t.Errorf("got %+v", tags)
+	}
+}
+
 func TestV2Folders(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/2/folders" {

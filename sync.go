@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -63,6 +64,12 @@ func cmdSync(args []string) error {
 	// one except for its timestamp, so the archive pass has to know what the
 	// server currently considers unread before it starts archiving.
 	if err := drain(ctx, client, lib, syncOptions{Folder: f, Full: *full, DryRun: *dryRun}); err != nil {
+		return err
+	}
+	// Tag before archiving: a rescued article whose tag write keeps failing may
+	// have been picked again since, and once archived it leaves the mirror and
+	// its queued tag with it.
+	if err := markKept(ctx, client, lib, *dryRun); err != nil {
 		return err
 	}
 	if err := archivePending(ctx, client, lib, path, *concurrency, *dryRun); err != nil {
@@ -190,6 +197,153 @@ feed:
 	return nil
 }
 
+// markKept writes the samlingN tags that rescues queued, so that clicking
+// samling4 in Instapaper shows everything kept through four triages.
+//
+// It runs after the drain plan is applied, so each article's tags are as fresh
+// as this sync can make them. A failed write is reported and stays queued for
+// the next sync; it never fails this one, since the tag is a record of the
+// rescue and not the rescue itself. Only ctx cancellation is returned.
+//
+// Each write is one request that removes every samlingN tag the article has
+// and adds samling<target>. remove_tags takes ids, which the mirror does not
+// keep, so they come from one GET /tags per sync, made only when an old
+// samlingN has to come off. Tag names are unique per account, so a name is enough
+// to find its id. Rescues are a handful per sync, so the writes go one at a
+// time.
+func markKept(ctx context.Context, client *instapaper.Client, lib *library.Library, dryRun bool) error {
+	var todo []string
+	for id := range lib.PendingKept {
+		if _, ok := lib.Entry(id); ok {
+			todo = append(todo, id)
+		} else if !dryRun {
+			// Deleted, archived elsewhere, or moved out of every mirrored
+			// folder since it was rescued. Its tags are no longer visible
+			// here, so a swap cannot be worked out; let it go.
+			lib.KeptDone(id)
+		}
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+	sort.Strings(todo)
+
+	if dryRun {
+		fmt.Printf("Would retry marking %s as kept:\n", plural(len(todo), "article", "articles"))
+		for _, id := range todo {
+			b, _ := lib.Entry(id)
+			fmt.Printf("  %s · %s\n", titleOf(b), keptTimes(lib.PendingKept[id]))
+		}
+		return nil
+	}
+
+	fmt.Printf("Marking %s as kept...\n", plural(len(todo), "article", "articles"))
+
+	// Tag ids are only needed to remove an old samlingN, so a sync whose
+	// rescues are all first-timers never asks for them.
+	var ids map[string]int64
+	tagIDs := func() (map[string]int64, error) {
+		if ids != nil {
+			return ids, nil
+		}
+		tags, err := client.Tags(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("reading your tags: %w", err)
+		}
+		ids = make(map[string]int64, len(tags))
+		for _, t := range tags {
+			ids[t.Name] = t.ID
+		}
+		return ids, nil
+	}
+
+	done, failed := 0, 0
+	for _, id := range todo {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		b, _ := lib.Entry(id)
+		target := lib.PendingKept[id]
+		var lookup map[string]int64
+		if needsRemoval(b.Tags, target) {
+			var err error
+			if lookup, err = tagIDs(); err != nil {
+				failed++
+				fmt.Fprintf(os.Stderr, "  could not mark %s (%s) as kept: %v\n", id, titleOf(b), err)
+				continue
+			}
+		}
+		add, remove := keptSwap(b.Tags, target, lookup)
+		if len(add) == 0 && len(remove) == 0 {
+			// Already right, e.g. an earlier write whose response was lost.
+			lib.KeptDone(id)
+			done++
+			continue
+		}
+		after, err := client.TagBookmark(ctx, id, add, remove)
+		if err != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "  could not mark %s (%s) as kept: %v\n", id, titleOf(b), err)
+			continue
+		}
+		names := make([]string, 0, len(after))
+		for _, t := range after {
+			names = append(names, t.Name)
+		}
+		// The response is the article's full tag list, so pick, list and
+		// status show the new count before the next sync reads it back.
+		lib.SetTags(id, names)
+		lib.KeptDone(id)
+		done++
+	}
+
+	fmt.Printf("  marked %d", done)
+	if failed > 0 {
+		fmt.Printf(", %d failed (left queued, will retry next sync)", failed)
+	}
+	fmt.Println()
+	return nil
+}
+
+// keptSwap works out the tag request that leaves an article carrying exactly
+// one samlingN tag, samling<target>. Other tags are never touched. A samlingN
+// name with no id in ids can't be removed, and doesn't need to be: it no
+// longer exists under that name on the account.
+func keptSwap(current []string, target int, ids map[string]int64) (add []string, remove []int64) {
+	want := library.KeptTag(target)
+	has := false
+	for _, t := range current {
+		if _, ok := library.KeptCount(t); !ok {
+			continue
+		}
+		if t == want {
+			has = true
+			continue
+		}
+		if id, ok := ids[t]; ok {
+			remove = append(remove, id)
+		}
+	}
+	if !has {
+		add = []string{want}
+	}
+	return add, remove
+}
+
+// needsRemoval reports whether current has a samlingN tag other than
+// samling<target>.
+func needsRemoval(current []string, target int) bool {
+	want := library.KeptTag(target)
+	for _, t := range current {
+		if _, ok := library.KeptCount(t); ok && t != want {
+			return true
+		}
+	}
+	return false
+}
+
+func keptTimes(n int) string { return fmt.Sprintf("kept ×%d", n) }
+
 // drain brings the local mirror up to date with Instapaper.
 //
 // There are two ways to do that, and a sync may need both:
@@ -262,6 +416,7 @@ type plan struct {
 	fresh    []library.Bookmark // not seen before
 	refresh  []library.Bookmark // already mirrored
 	rescued  []library.Bookmark // re-saved by hand; must not be archived
+	kept     map[string]int     // rescued id -> the samlingN count it moves to
 	stillDue int                // picked, not re-saved, still to archive
 
 	gone      []string            // mirrored, but no longer in any mirrored folder
@@ -380,14 +535,14 @@ func classify(lib *library.Library, b library.Bookmark, p *plan) {
 	case pending && b.Time > e.PickedAt:
 		// Saved again after we handed it to the browser: the triage gesture
 		// for "actually, I want to read this". Keep it.
-		p.rescued = append(p.rescued, b)
+		p.rescue(lib, b)
 	case pending:
 		// Still sitting where we left it, awaiting archive.
 		p.stillDue++
 	case lib.IsArchived(b.ID):
 		// Tombstoned but back in a mirrored folder, so it was re-saved or
 		// unarchived deliberately. The user's action outranks our bookkeeping.
-		p.rescued = append(p.rescued, b)
+		p.rescue(lib, b)
 	default:
 		if _, known := lib.Bookmarks[b.ID]; known {
 			p.refresh = append(p.refresh, b)
@@ -395,6 +550,18 @@ func classify(lib *library.Library, b library.Bookmark, p *plan) {
 			p.fresh = append(p.fresh, b)
 		}
 	}
+}
+
+// rescue plans keeping b and bumping its samlingN count. The count starts
+// from the higher of the tag the server reports and a bump still queued from
+// an earlier sync, so a rescue that lands while the previous tag write is
+// still failing counts as a rescue of its own rather than repeating it.
+func (p *plan) rescue(lib *library.Library, b library.Bookmark) {
+	p.rescued = append(p.rescued, b)
+	if p.kept == nil {
+		p.kept = map[string]int{}
+	}
+	p.kept[b.ID] = max(b.Kept(), lib.PendingKept[b.ID]) + 1
 }
 
 // location is where a bookmark lives, in the mirror's terms: library.Unread,
@@ -443,6 +610,7 @@ func finish(lib *library.Library, p *plan, dryRun bool) {
 	}
 	for _, b := range p.rescued {
 		lib.Rescue(b)
+		lib.QueueKept(b.ID, p.kept[b.ID])
 	}
 	for _, id := range p.gone {
 		lib.Drop(id)
@@ -483,7 +651,11 @@ func report(p *plan, dryRun bool) {
 	if len(p.rescued) > 0 {
 		fmt.Printf("  %s %s you re-saved:\n", would("keep"), plural(len(p.rescued), "article", "articles"))
 		for _, b := range p.rescued {
-			fmt.Printf("    %s\n", titleOf(b))
+			mark := keptTimes(p.kept[b.ID])
+			if dryRun {
+				mark = "would mark as " + mark
+			}
+			fmt.Printf("    %s · %s\n", titleOf(b), mark)
 		}
 	}
 	if len(p.goneDue) > 0 {

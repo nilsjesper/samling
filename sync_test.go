@@ -26,6 +26,7 @@ type fakeArticle struct {
 	folder   *int64 // nil is the home list
 	archived bool
 	modified int64 // last change, which is what the `since` feed filters on
+	tags     []string
 }
 
 // fakeInstapaper models API v2's GET /bookmarks (offset paging by section, and
@@ -37,9 +38,20 @@ type fakeInstapaper struct {
 	deleted  map[string]int64 // id -> when it was deleted
 	failIDs  map[string]bool  // move requests that should fail
 	failFeed bool             // `since` requests answer 500
+	failTags bool             // tag writes answer 500
 	archived []string
 
-	listCalls, sinceCalls, moveCalls int
+	tagIDs    map[string]int64 // the account's tags, by name; never deleted
+	tagWrites []tagWrite
+
+	listCalls, sinceCalls, moveCalls, tagListCalls int
+}
+
+// tagWrite is one POST /bookmarks/{id}/tags the fake accepted.
+type tagWrite struct {
+	id     string
+	add    []string
+	remove []int64
 }
 
 const pastTime = 1690000000
@@ -49,6 +61,7 @@ func newFakeServer(n int) *fakeInstapaper {
 		articles: map[string]*fakeArticle{},
 		deleted:  map[string]int64{},
 		failIDs:  map[string]bool{},
+		tagIDs:   map[string]int64{},
 	}
 	for _, id := range ids(n) {
 		f.articles[id] = &fakeArticle{time: pastTime, modified: pastTime}
@@ -64,8 +77,43 @@ func (f *fakeInstapaper) save(id string) {
 	defer f.mu.Unlock()
 	now := time.Now().Unix()
 	// Re-saving reuses the id, bumps the save time, and puts it back in home.
-	f.articles[id] = &fakeArticle{time: now, modified: now}
+	// Tags survive it (verified live with the browser extension).
+	a := &fakeArticle{time: now, modified: now}
+	if old, ok := f.articles[id]; ok {
+		a.tags = old.tags
+	}
+	f.articles[id] = a
 	delete(f.deleted, id)
+}
+
+// tag puts tags on an article directly, as the web app would, without
+// touching its modification time.
+func (f *fakeInstapaper) tag(id string, names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, n := range names {
+		f.tagID(n)
+	}
+	f.articles[id].tags = append(f.articles[id].tags, names...)
+}
+
+// tagID returns a tag's id, creating the tag if need be. Ids are offset so
+// that they can't be confused with bookmark ids in a test.
+func (f *fakeInstapaper) tagID(name string) int64 {
+	if id, ok := f.tagIDs[name]; ok {
+		return id
+	}
+	id := int64(4220000 + len(f.tagIDs))
+	f.tagIDs[name] = id
+	return id
+}
+
+func (f *fakeInstapaper) tagJSON(names []string) []map[string]any {
+	out := []map[string]any{}
+	for _, n := range names {
+		out = append(out, map[string]any{"id": f.tagID(n), "name": n, "slug": n, "count": 1})
+	}
+	return out
 }
 
 func (f *fakeInstapaper) archiveElsewhere(id string) {
@@ -96,7 +144,7 @@ func (f *fakeInstapaper) json(id string, a *fakeArticle) map[string]any {
 		"progress": map[string]any{"percentage": 0.0, "timestamp": 0},
 		"liked":    false, "archived": a.archived, "time": a.time,
 		"pubtime": nil, "author": nil, "folder_id": a.folder,
-		"tags": []any{}, "private_source": nil, "category": 0,
+		"tags": f.tagJSON(a.tags), "private_source": nil, "category": 0,
 	}
 }
 
@@ -151,6 +199,58 @@ func (f *fakeInstapaper) handler(t *testing.T) http.HandlerFunc {
 			a.archived, a.modified = true, time.Now().Unix()
 			f.archived = append(f.archived, id)
 			json.NewEncoder(w).Encode(f.json(id, a))
+
+		case r.Method == http.MethodGet && r.URL.Path == "/api/2/tags":
+			f.tagListCalls++
+			var names []string
+			for n := range f.tagIDs {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			json.NewEncoder(w).Encode(map[string]any{"tags": f.tagJSON(names)})
+
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/2/bookmarks/") &&
+			strings.HasSuffix(r.URL.Path, "/tags"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/2/bookmarks/"), "/tags")
+			if f.failTags {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":{"code":500,"message":"boom"}}`))
+				return
+			}
+			var body struct {
+				Add    []struct{ Name string } `json:"add_tags"`
+				Remove []struct{ ID int64 }    `json:"remove_tags"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Add)+len(body.Remove) == 0 {
+				t.Errorf("tags body: %+v, %v", body, err)
+			}
+			a, ok := f.articles[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"error":{"code":404,"message":"Not found"}}`))
+				return
+			}
+			tw := tagWrite{id: id}
+			gone := map[int64]bool{}
+			for _, rm := range body.Remove {
+				gone[rm.ID] = true
+				tw.remove = append(tw.remove, rm.ID)
+			}
+			var kept []string
+			for _, n := range a.tags {
+				if !gone[f.tagID(n)] {
+					kept = append(kept, n)
+				}
+			}
+			for _, ad := range body.Add {
+				tw.add = append(tw.add, ad.Name)
+				f.tagID(ad.Name)
+				kept = append(kept, ad.Name)
+			}
+			// A tag change shows up in the feed, but leaves `time` alone.
+			a.tags, a.modified = kept, time.Now().Unix()
+			f.tagWrites = append(f.tagWrites, tw)
+			json.NewEncoder(w).Encode(map[string]any{"created_tags": []any{}, "tags": f.tagJSON(a.tags)})
 
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL)

@@ -182,6 +182,49 @@ func (c *Client) Move(ctx context.Context, id, section string) (Bookmark, error)
 	return b, err
 }
 
+// Tags lists every tag on the account. Tags with no bookmarks left are
+// included: v2 has no endpoint for deleting a tag, so they linger until removed
+// in the web app.
+func (c *Client) Tags(ctx context.Context) ([]Tag, error) {
+	var out struct {
+		Tags []Tag `json:"tags"`
+	}
+	if err := c.get2(ctx, "/api/2/tags", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Tags, nil
+}
+
+// TagBookmark adds tags by name and removes tags by id in a single request,
+// and returns the bookmark's full tag list afterwards. A name that does not
+// exist yet is created. Removal takes ids only; the API has no by-name form.
+//
+// Verified live: this changes neither the bookmark's `time` nor its place in
+// its list, so it never looks like a re-save. It does surface in the next
+// `since` feed, as a change with `time` unchanged. Repeating the same request
+// leaves the same result, which is what makes the transport's retries safe.
+func (c *Client) TagBookmark(ctx context.Context, id string, add []string, remove []int64) ([]Tag, error) {
+	type ref struct {
+		ID   int64  `json:"id,omitempty"`
+		Name string `json:"name,omitempty"`
+	}
+	var body struct {
+		Add    []ref `json:"add_tags,omitempty"`
+		Remove []ref `json:"remove_tags,omitempty"`
+	}
+	for _, n := range add {
+		body.Add = append(body.Add, ref{Name: n})
+	}
+	for _, r := range remove {
+		body.Remove = append(body.Remove, ref{ID: r})
+	}
+	var out struct {
+		Tags []Tag `json:"tags"`
+	}
+	err := c.post2(ctx, "/api/2/bookmarks/"+url.PathEscape(id)+"/tags", body, &out)
+	return out.Tags, err
+}
+
 // Folders lists the account's user-created folders, in the user's own order.
 func (c *Client) Folders(ctx context.Context) ([]Folder, error) {
 	var out struct {

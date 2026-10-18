@@ -13,7 +13,9 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +74,40 @@ func (b Bookmark) Age() time.Duration {
 	return time.Since(time.Unix(b.Time, 0))
 }
 
+// keptTag matches the tags sync uses to count rescues: samling1, samling2, ...
+// Strict on purpose, so that a tag like "samling" or "samling02" the user made
+// by hand is never mistaken for a count, and never removed by a swap.
+var keptTag = regexp.MustCompile(`^samling([1-9][0-9]*)$`)
+
+// KeptTag is the tag that marks an article kept through n triages.
+func KeptTag(n int) string { return "samling" + strconv.Itoa(n) }
+
+// KeptCount parses a tag name written by KeptTag.
+func KeptCount(tag string) (int, bool) {
+	m := keptTag.FindStringSubmatch(tag)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false // too many digits to be ours
+	}
+	return n, true
+}
+
+// Kept is how many times the article has been re-saved after a pick, as its
+// samlingN tag records; zero when it has none. An article should carry at most
+// one such tag, but if it somehow has several the highest wins.
+func (b Bookmark) Kept() int {
+	kept := 0
+	for _, t := range b.Tags {
+		if n, ok := KeptCount(t); ok && n > kept {
+			kept = n
+		}
+	}
+	return kept
+}
+
 // ReadEntry is an article picked locally but not yet archived remotely.
 type ReadEntry struct {
 	Bookmark
@@ -97,6 +133,13 @@ type Library struct {
 	// here has never been read whole and needs a full sync before the feed's
 	// deltas mean anything for it.
 	Synced []string `json:"synced_folders,omitempty"`
+
+	// PendingKept maps a rescued article's id to the samlingN count it should
+	// carry, until a sync manages to write that tag. Storing the target rather
+	// than "add one" keeps a retry idempotent. The field is optional, so the
+	// schema version stays at 2: a build that predates it just drops the queue
+	// and leaves those tags unwritten.
+	PendingKept map[string]int `json:"pending_kept,omitempty"`
 
 	archived map[string]struct{} // index over Archived, built on load
 }
@@ -273,6 +316,67 @@ func (l *Library) Rescue(b Bookmark) {
 func (l *Library) Pending(id string) (ReadEntry, bool) {
 	e, ok := l.Read[id]
 	return e, ok
+}
+
+// Entry returns the mirrored or pending-archive copy of an article.
+func (l *Library) Entry(id string) (Bookmark, bool) {
+	if b, ok := l.Bookmarks[id]; ok {
+		return b, true
+	}
+	if e, ok := l.Read[id]; ok {
+		return e.Bookmark, true
+	}
+	return Bookmark{}, false
+}
+
+// SetTags replaces the tags of the mirrored or pending-archive copy of an
+// article, whichever exists.
+func (l *Library) SetTags(id string, tags []string) {
+	if b, ok := l.Bookmarks[id]; ok {
+		b.Tags = tags
+		l.Bookmarks[id] = b
+	}
+	if e, ok := l.Read[id]; ok {
+		e.Tags = tags
+		l.Read[id] = e
+	}
+}
+
+// QueueKept records that an article should be tagged samling<n>.
+func (l *Library) QueueKept(id string, n int) {
+	if l.PendingKept == nil {
+		l.PendingKept = map[string]int{}
+	}
+	l.PendingKept[id] = n
+}
+
+// KeptDone clears an article from the tag queue.
+func (l *Library) KeptDone(id string) {
+	delete(l.PendingKept, id)
+	if len(l.PendingKept) == 0 {
+		l.PendingKept = nil
+	}
+}
+
+// MostKept returns up to n unread articles with a samlingN tag, highest count
+// first.
+func (l *Library) MostKept(n int) []Bookmark {
+	var out []Bookmark
+	for _, b := range l.Bookmarks {
+		if b.Kept() > 0 {
+			out = append(out, b)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if ki, kj := out[i].Kept(), out[j].Kept(); ki != kj {
+			return ki > kj
+		}
+		return out[i].ID < out[j].ID
+	})
+	if n >= 0 && len(out) > n {
+		out = out[:n]
+	}
+	return out
 }
 
 // Filter narrows which bookmarks are eligible to be picked.

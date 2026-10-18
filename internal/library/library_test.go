@@ -27,6 +27,50 @@ func seed(t *testing.T, n int) *Library {
 	return l
 }
 
+func TestKeptCountIsStrict(t *testing.T) {
+	for tag, want := range map[string]int{
+		"samling1": 1, "samling12": 12,
+		"samling": 0, "samling0": 0, "samling02": 0, "Samling2": 0, "samling2x": 0,
+		"xsamling2": 0, "samling99999999999999999999": 0, "ifttt": 0,
+	} {
+		got, ok := KeptCount(tag)
+		if ok != (want > 0) || got != want {
+			t.Errorf("KeptCount(%q) = %d, %v; want %d", tag, got, ok, want)
+		}
+	}
+	if b := (Bookmark{Tags: []string{"samling2", "ifttt", "samling5"}}); b.Kept() != 5 {
+		t.Errorf("Kept() = %d, want the highest of several", b.Kept())
+	}
+}
+
+func TestMostKeptAndTheQueueRoundTrip(t *testing.T) {
+	l := seed(t, 4)
+	for id, tags := range map[string][]string{"a": {"samling2"}, "b": {"samling7", "ifttt"}, "c": {"ifttt"}} {
+		l.SetTags(id, tags)
+	}
+	got := l.MostKept(5)
+	if len(got) != 2 || got[0].ID != "b" || got[1].ID != "a" {
+		t.Errorf("MostKept = %+v, want b then a", got)
+	}
+
+	l.QueueKept("d", 1)
+	path := filepath.Join(t.TempDir(), "library.json")
+	if err := l.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.PendingKept["d"] != 1 || r.Version != 2 {
+		t.Errorf("reloaded queue %v, version %d", r.PendingKept, r.Version)
+	}
+	r.KeptDone("d")
+	if r.PendingKept != nil {
+		t.Errorf("queue = %v after the last entry was done", r.PendingKept)
+	}
+}
+
 func TestPickIsDistinctAndDoesNotMutate(t *testing.T) {
 	l := seed(t, 10)
 	got := l.Pick(4, Filter{}, testRNG())
