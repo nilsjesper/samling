@@ -49,15 +49,25 @@ floats them to the top of your Unread list.
 samling sync          # archives the batch, keeps the ones you re-saved
 ```
 
-samling detects the re-saves and leaves them alone. Re-saving reuses an
-article's `bookmark_id`, so without that detection your keepers would be
-archived by the very sync that follows, or stay tombstoned and never be served
-again. A deliberate re-save always outranks samling's bookkeeping.
+samling detects the re-saves and leaves them alone. Re-saving the same URL
+reuses an article's `bookmark_id`, so without that detection your keepers
+would be archived by the very sync that follows, or stay tombstoned and never
+be served again. A deliberate re-save always outranks samling's bookkeeping.
+
+Old articles often redirect (to `https`, to or from `www`, or to a new path),
+and the extension saves the address it lands on. Instapaper then makes a new
+bookmark instead. samling matches a new bookmark saved after a pick back to
+that pick when they're on the same site and have the same address (ignoring
+scheme, `www`, query and trailing slash) or the same title (ignoring case,
+punctuation and a ` | Site` suffix). It archives the old copy so the article
+isn't in the pool twice, and reports the new one as kept "(re-saved at a new
+address)".
 
 Each keeper also gets a counter tag in Instapaper: `samling1` the first time
 you keep it, then `samling2`, `samling3` and so on, swapped in place so an
 article only ever has one. Click `samling4` in Instapaper to see everything
-that survived four triages. Kept articles stay in the pick pool, and `pick`,
+that survived four triages. A keeper that came back at a new address carries
+its count over to the new copy. Kept articles stay in the pick pool, and `pick`,
 `list` and `status` show the count (`kept ×3`). Tagging doesn't change an
 article's save time or its place in Unread. If a tag write fails, `sync` says
 so, carries on, and retries it next time.
@@ -237,10 +247,13 @@ Things worth knowing if you plan to hack on this:
   offset advances by both. samling stores the time just *before* each sync
   started, minus ten minutes for clock skew, as the next `since`. Reading a
   change twice is harmless; missing one is not.
-- **Re-saving reuses the bookmark id** and refreshes the article's `time`.
-  That timestamp is the only way to tell "I re-saved this during triage" from
-  "this is still queued for archiving", which is why `sync` fetches before it
-  archives. (v2 `id` is the same number as v1 `bookmark_id`, so libraries from
+- **Re-saving reuses the bookmark id, but only for an identical URL**, and
+  refreshes the article's `time`. That timestamp is the only way to tell "I
+  re-saved this during triage" from "this is still queued for archiving",
+  which is why `sync` fetches before it archives. A re-save from the browser
+  extension uses the address the page redirects to, so an old article often
+  comes back as a new bookmark under a new id (seen live: two of three
+  re-saves in one triage). `sync` matches those by site plus address or title. (v2 `id` is the same number as v1 `bookmark_id`, so libraries from
   older versions of samling carry straight over.)
 - **Offset paging isn't a snapshot.** If an article leaves Unread while a full
   read is paging through it, everything shifts up one place and one article is

@@ -417,6 +417,7 @@ type plan struct {
 	refresh  []library.Bookmark // already mirrored
 	rescued  []library.Bookmark // re-saved by hand; must not be archived
 	kept     map[string]int     // rescued id -> the samlingN count it moves to
+	moved    []newAddress       // rescued, but re-saved under a new id
 	stillDue int                // picked, not re-saved, still to archive
 
 	gone      []string            // mirrored, but no longer in any mirrored folder
@@ -465,6 +466,7 @@ func readFolder(ctx context.Context, client *instapaper.Client, lib *library.Lib
 			p.goneDue = append(p.goneDue, e)
 		}
 	}
+	matchNewAddresses(lib, p)
 	return p, nil
 }
 
@@ -526,6 +528,7 @@ func readFeed(ctx context.Context, client *instapaper.Client, lib *library.Libra
 			p.deleted = append(p.deleted, id)
 		}
 	}
+	matchNewAddresses(lib, p)
 	return p, nil
 }
 
@@ -612,6 +615,11 @@ func finish(lib *library.Library, p *plan, dryRun bool) {
 		lib.Rescue(b)
 		lib.QueueKept(b.ID, p.kept[b.ID])
 	}
+	for _, m := range p.moved {
+		// The count now lives on the new copy; the old one is archived as
+		// usual, so a tag still queued for it would only be dropped later.
+		lib.KeptDone(m.old.ID)
+	}
 	for _, id := range p.gone {
 		lib.Drop(id)
 	}
@@ -654,6 +662,9 @@ func report(p *plan, dryRun bool) {
 			mark := keptTimes(p.kept[b.ID])
 			if dryRun {
 				mark = "would mark as " + mark
+			}
+			if _, moved := p.movedFrom(b.ID); moved {
+				mark += " (re-saved at a new address)"
 			}
 			fmt.Printf("    %s · %s\n", titleOf(b), mark)
 		}

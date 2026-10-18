@@ -27,6 +27,8 @@ type fakeArticle struct {
 	archived bool
 	modified int64 // last change, which is what the `since` feed filters on
 	tags     []string
+	url      string // empty means https://example.com/<id>
+	title    string // empty means "Article <id>"
 }
 
 // fakeInstapaper models API v2's GET /bookmarks (offset paging by section, and
@@ -80,10 +82,21 @@ func (f *fakeInstapaper) save(id string) {
 	// Tags survive it (verified live with the browser extension).
 	a := &fakeArticle{time: now, modified: now}
 	if old, ok := f.articles[id]; ok {
-		a.tags = old.tags
+		a.tags, a.url, a.title = old.tags, old.url, old.title
 	}
 	f.articles[id] = a
 	delete(f.deleted, id)
+}
+
+// add puts an article with a real address on the server, saved at time at.
+// at == 0 means now, as a save from the browser extension would.
+func (f *fakeInstapaper) add(id, url, title string, at int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if at == 0 {
+		at = time.Now().Unix()
+	}
+	f.articles[id] = &fakeArticle{time: at, modified: at, url: url, title: title}
 }
 
 // tag puts tags on an article directly, as the web app would, without
@@ -139,8 +152,15 @@ func (f *fakeInstapaper) deleteElsewhere(id string) {
 
 func (f *fakeInstapaper) json(id string, a *fakeArticle) map[string]any {
 	n, _ := strconv.ParseInt(id, 10, 64)
+	u, title := a.url, a.title
+	if u == "" {
+		u = "https://example.com/" + id
+	}
+	if title == "" {
+		title = "Article " + id
+	}
 	return map[string]any{
-		"id": n, "url": "https://example.com/" + id, "title": "Article " + id,
+		"id": n, "url": u, "title": title,
 		"progress": map[string]any{"percentage": 0.0, "timestamp": 0},
 		"liked":    false, "archived": a.archived, "time": a.time,
 		"pubtime": nil, "author": nil, "folder_id": a.folder,
