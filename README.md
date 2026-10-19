@@ -145,39 +145,41 @@ Or build from a checkout: `go build -o samling .`
 
 ## Setup
 
-1. **Get an API key.** Instapaper's Full API needs a consumer token, and every
-   request is reviewed by a human. Apply at
-   <https://www.instapaper.com/developers/applications/create>.
+1. **Create an Instapaper application** at
+   <https://www.instapaper.com/developers/applications/create>. A new
+   application starts in "Owner Only" mode and works right away for your own
+   account; Instapaper's human review is only needed before other people can
+   sign in with it.
 
-2. **Give it to samling**, either in `~/.samling/config.json`:
+2. **Sign in.** Pick one:
 
-   ```json
-   { "consumer_key": "…", "consumer_secret": "…" }
-   ```
+   - **Access token (simplest).** On your application's page under
+     [Applications](https://www.instapaper.com/developers/applications), select
+     "Generate access token", then run `samling login --token` and paste it at
+     the (hidden) prompt, or pipe it in: `pbpaste | samling login --token`.
+     It's never accepted as an argument, so it stays out of your shell
+     history. Nothing else is needed: no consumer key, no `config.json`. One
+     token works on every machine, but regenerating it revokes the old one
+     everywhere.
+   - **Browser sign-in.** Give samling the application's consumer key and
+     secret, in `~/.samling/config.json`:
 
-   or via `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`, which take
-   precedence.
+     ```json
+     { "consumer_key": "…", "consumer_secret": "…" }
+     ```
 
-3. **Let samling sign in.** Pick one:
+     or via `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`, which take
+     precedence. On the application's page, add
+     `http://127.0.0.1:8919/callback` to the Callback URIs (Instapaper only
+     accepts a local callback while the application is "Owner Only"). Then
+     `samling login` opens the consent page and catches the redirect on that
+     port. If 8919 is taken, use `samling login --port N` and register that
+     port's URI instead.
 
-   - **Browser sign-in (the default).** On your application's page under
-     [Applications](https://www.instapaper.com/developers/applications), add
-     `http://127.0.0.1:8919/callback` to the Callback URIs. Instapaper only
-     accepts a local callback on an application in "Owner Only" mode, which is
-     what a personal key is anyway. Then `samling login` opens the consent page
-     and catches the redirect on that port. If 8919 is taken, use
-     `samling login --port N` and register that port's URI instead.
-   - **Access token.** On the same page, select "Generate access token", then
-     run `samling login --token` and paste it at the (hidden) prompt, or pipe it
-     in: `pbpaste | samling login --token`. It's never accepted as an argument,
-     so it stays out of your shell history. One token works on every machine,
-     but regenerating it revokes the old one everywhere.
-
-4. **Sync and pick.**
+3. **Sync and pick.**
 
    ```sh
-   samling login
-   samling sync     # pulls your unread list down
+   samling sync     # the first sync reads your whole unread list
    samling pick 3
    ```
 
@@ -269,7 +271,7 @@ Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
 
 | file | |
 |---|---|
-| `config.json` | Your consumer key and secret |
+| `config.json` | Your consumer key and secret (only for browser sign-in and `--password`) |
 | `token.json` | Your access token (mode `0600`) |
 | `library.json` | The local mirror: unread, pending-archive, tombstones, queued tags, and the sync cursor |
 | `linkcheck.log` | One line per link `pick` or `list` checked: time, verdict, reason, address |
@@ -336,7 +338,8 @@ go vet ./...
 ```
 
 The tests cover the things most likely to break silently: the OAuth 1.0a
-signature (checked against the worked example in RFC 5849 §3.4.1.1), and sync
+signature (checked against the worked example in RFC 5849 §3.4.1.1), the OAuth 2
+sign-in (state checks, code exchange and its errors, against a fake server), and sync
 against a fake v2 server. That includes paging, the change feed and its
 deletions, re-saved keepers and their `samlingN` counters, picks archived
 elsewhere, migrating a v1 library, and the cursor advancing only after a

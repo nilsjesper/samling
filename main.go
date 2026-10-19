@@ -136,15 +136,15 @@ The triage loop:
                          and kept, and tagged samling1, samling2, ...
                          for each time you keep them
 
-Setup:
-  1. Request an API consumer key at
-     https://www.instapaper.com/developers/applications/create
-  2. Put it in ~/.samling/config.json as {"consumer_key":"...","consumer_secret":"..."}
-     or set INSTAPAPER_CONSUMER_KEY / INSTAPAPER_CONSUMER_SECRET
-  3. Either register http://127.0.0.1:8919/callback as a callback URI on the
-     application's page, or generate an access token there and use
-     samling login --token
-  4. samling login && samling sync && samling pick 3
+Setup (create an application at
+https://www.instapaper.com/developers/applications/create, then pick one):
+  Token     On the application's page, select "Generate access token", then
+            samling login --token
+  Browser   Put the key in ~/.samling/config.json as
+            {"consumer_key":"...","consumer_secret":"..."}, register
+            http://127.0.0.1:8919/callback as a callback URI, then
+            samling login
+  Then:     samling sync && samling pick 3
 
 State lives in ~/.samling (override with SAMLING_HOME).
 Only 'sync', 'login' and 'folders' talk to Instapaper. 'pick' and 'list' fetch
@@ -388,21 +388,15 @@ func cmdFolders(args []string) error {
 
 // --- helpers -----------------------------------------------------------------------
 
+// newClient is the client for sync and folders. Both only make v2 calls, which
+// authenticate with the bearer token alone, so the consumer key is not needed:
+// a machine set up with `login --token` has no config.json at all.
 func newClient() (*instapaper.Client, error) {
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		return nil, err
-	}
 	tok, err := config.LoadToken()
 	if err != nil {
 		return nil, err
 	}
-	return instapaper.New(oauth1.Credentials{
-		ConsumerKey:    cfg.ConsumerKey,
-		ConsumerSecret: cfg.ConsumerSecret,
-		Token:          tok.Token,
-		TokenSecret:    tok.TokenSecret,
-	}), nil
+	return instapaper.New(oauth1.Credentials{Token: tok.Token}), nil
 }
 
 // signalContext cancels on Ctrl-C so a long sync can stop cleanly and save
