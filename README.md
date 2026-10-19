@@ -137,11 +137,25 @@ twice, even if a later sync still reports it as unread.
 
 ## Install
 
+With Homebrew (macOS or Linux):
+
+```sh
+brew install nilsjesper/tap/samling
+```
+
+Or download a binary for macOS, Linux or Windows from
+[Releases](https://github.com/nilsjesper/samling/releases), or, with Go:
+
 ```sh
 go install github.com/nilsjesper/samling@latest
 ```
 
-Or build from a checkout: `go build -o samling .`
+Or build from a checkout: `go build -o samling .` `samling version` says which
+one you have.
+
+The release binaries aren't signed. The Homebrew install clears macOS's
+quarantine flag for you; for a downloaded binary, run
+`xattr -d com.apple.quarantine samling` once if macOS won't open it.
 
 ## Setup
 
@@ -206,6 +220,7 @@ in again.
 | `samling survivors [N]` | List the articles you keep re-saving, most-kept first |
 | `samling undo` | Put the most recent pick back (before the next sync) |
 | `samling folders` | List your Instapaper folder ids |
+| `samling version` | Print the version |
 
 ### Filters
 

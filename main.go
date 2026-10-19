@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -57,6 +58,9 @@ func main() {
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 		return
+	case "version", "--version":
+		fmt.Println("samling", versionString())
+		return
 	default:
 		fmt.Fprintf(os.Stderr, "samling: unknown command %q\n\n", cmd)
 		usage(os.Stderr)
@@ -67,6 +71,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "samling: "+err.Error())
 		os.Exit(1)
 	}
+}
+
+// version is set at release time with -ldflags "-X main.version=...".
+var version string
+
+// versionString is the release version, or for `go install …@vX.Y.Z` the
+// module version Go recorded, or "dev" for a build from a checkout.
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
 }
 
 func usage(w *os.File) {
@@ -84,6 +103,7 @@ Commands:
   survivors List the articles you keep re-saving, most-kept first
   undo      Put the most recent pick back (only works before the next sync)
   folders   List your Instapaper folder ids
+  version   Print the version
 
 Pick and list take the count as a bare argument (default 1):
   samling pick 20
