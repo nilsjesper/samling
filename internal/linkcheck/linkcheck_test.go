@@ -149,3 +149,27 @@ func TestCheckAllKeepsOrderAndRunsInParallel(t *testing.T) {
 		}
 	}
 }
+
+func init() { recheckDelay = time.Millisecond }
+
+// blipDNS says "no such host" for its first lookup of a name, then resolves.
+type blipDNS struct{ seen map[string]bool }
+
+func (b *blipDNS) LookupHost(_ context.Context, host string) ([]string, error) {
+	if !b.seen[host] {
+		b.seen[host] = true
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	return []string{"127.0.0.1"}, nil
+}
+
+// A single "no such host" is not enough to call a domain gone: live, a
+// working www.bbc.co.uk came back that way once, mid-batch.
+func TestOneMissedLookupIsNotDead(t *testing.T) {
+	c := New()
+	c.Resolver = &blipDNS{seen: map[string]bool{"www.instapaper.com": true}}
+	c.Canary = "www.instapaper.com"
+	if r := c.Check(context.Background(), "http://bbc.invalid/page"); r.Verdict == Dead {
+		t.Errorf("one missed lookup gave %+v, want not dead", r)
+	}
+}

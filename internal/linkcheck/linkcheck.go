@@ -122,7 +122,7 @@ func (c *Checker) Check(ctx context.Context, raw string) Result {
 	// is told apart from every other way a request can fail.
 	if net.ParseIP(u.Hostname()) == nil {
 		if _, err := c.Resolver.LookupHost(ctx, u.Hostname()); err != nil {
-			if notFound(err) && c.online(ctx) {
+			if notFound(err) && c.stillGone(ctx, u.Hostname()) && c.online(ctx) {
 				r.Verdict, r.Reason = Dead, "domain no longer resolves"
 			} else {
 				r.Reason = "DNS lookup failed"
@@ -184,7 +184,7 @@ func (c *Checker) request(ctx context.Context, method, raw string) (*http.Respon
 // so a vanished domain can still show up here rather than in the lookup.
 func (c *Checker) classifyError(ctx context.Context, r Result, err error) Result {
 	switch {
-	case notFound(err) && c.online(ctx):
+	case notFound(err) && c.stillGone(ctx, dnsName(err)) && c.online(ctx):
 		r.Verdict, r.Reason = Dead, "domain no longer resolves"
 	case errors.Is(err, syscall.ECONNREFUSED):
 		r.Verdict, r.Reason = Dead, "connection refused"
@@ -209,11 +209,37 @@ func (c *Checker) online(ctx context.Context) bool {
 	return err == nil
 }
 
+// recheckDelay is how long stillGone waits before asking again.
+var recheckDelay = 500 * time.Millisecond
+
+// stillGone asks about host a second time, a moment later. Seen live: a pick's
+// batch had www.bbc.co.uk come back "no such host" alongside two genuinely
+// dead domains, in the same second, and resolve fine on every run after. A
+// dead verdict archives the article, so one answer is not enough to bury it.
+func (c *Checker) stillGone(ctx context.Context, host string) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(recheckDelay):
+	}
+	_, err := c.Resolver.LookupHost(ctx, host)
+	return notFound(err)
+}
+
 // notFound reports an NXDOMAIN-style answer: the name does not exist, as
 // opposed to a lookup that failed or timed out.
 func notFound(err error) bool {
 	var dns *net.DNSError
 	return errors.As(err, &dns) && dns.IsNotFound
+}
+
+// dnsName is the host a failed lookup was for.
+func dnsName(err error) string {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return dns.Name
+	}
+	return ""
 }
 
 func gone(code int) bool { return code == http.StatusNotFound || code == http.StatusGone }
