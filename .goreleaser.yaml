@@ -1,0 +1,54 @@
+# Release with a version tag: `git tag v0.1.0 && git push origin v0.1.0`.
+# The GitHub workflow in .github/workflows/release.yml runs this; try it
+# locally with `goreleaser release --snapshot --clean`.
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+
+homebrew_casks:
+  - name: samling
+    binaries: [samling]
+    homepage: https://github.com/nilsjesper/samling
+    description: Shuffle your way through an Instapaper backlog
+    repository:
+      owner: nilsjesper
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    # The binary isn't signed or notarized, so without this macOS refuses to
+    # run it ("cannot be opened because it is from an unidentified developer").
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/samling"]
+          end
