@@ -427,3 +427,27 @@ func TestInFolderTreatsUnsetAsUnread(t *testing.T) {
 		t.Error("a folder bookmark should match its own folder only")
 	}
 }
+
+func TestSurvivorsOrder(t *testing.T) {
+	l := New()
+	for _, b := range []Bookmark{
+		{ID: "undated", Tags: []string{"samling2"}},
+		{ID: "new", Time: 300, Tags: []string{"samling2"}},
+		{ID: "old", Time: 100, Tags: []string{"samling2"}},
+		{ID: "most", Time: 900, Tags: []string{"samling5"}},
+		{ID: "once", Time: 50, Tags: []string{"samling1"}},
+		{ID: "never", Time: 10},
+	} {
+		l.Bookmarks[b.ID] = b
+	}
+	var ids []string
+	for _, b := range l.Survivors(2) {
+		ids = append(ids, b.ID)
+	}
+	if got := strings.Join(ids, " "); got != "most old new undated" {
+		t.Errorf("Survivors(2) = %s, want most old new undated", got)
+	}
+	if got := len(l.Survivors(0)); got != 5 {
+		t.Errorf("Survivors(0) returned %d, want the 5 kept at all", got)
+	}
+}

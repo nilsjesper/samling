@@ -48,6 +48,8 @@ func main() {
 		err = cmdPick(args, false)
 	case "status":
 		err = cmdStatus(args)
+	case "survivors":
+		err = cmdSurvivors(args)
 	case "undo":
 		err = cmdUndo(args)
 	case "folders":
@@ -79,6 +81,7 @@ Commands:
   pick N    Open N random unread articles and mark them read locally
   list N    Same selection as pick, printed instead of opened
   status    Show unread / pending / archived counts
+  survivors List the articles you keep re-saving, most-kept first
   undo      Put the most recent pick back (only works before the next sync)
   folders   List your Instapaper folder ids
 
@@ -93,9 +96,15 @@ Pick and list flags:
   --newer-than SPAN  Only articles saved within the last SPAN
   --starred          Only starred articles
   --unstarred        Only unstarred articles
+  --kept [K]         Only articles kept at least K times (default 1), e.g.
+                     samling pick 3 --kept 2
   --seed N           Reproducible shuffle
   --no-open          Mark read without opening tabs — burn down a chunk you
                      are never going to read (use 'list' to preview instead)
+
+Survivors flags:
+  N                  Show at most N (default all)
+  --min K            Only articles kept at least K times (default 1)
 
 Login flags:
   (none)             Sign in through your browser (OAuth 2). Needs
@@ -156,6 +165,8 @@ func cmdPick(args []string, open bool) error {
 	unstarred := fs.Bool("unstarred", false, "only unstarred articles")
 	seed := fs.Int64("seed", 0, "reproducible shuffle")
 	noOpen := fs.Bool("no-open", false, "print instead of opening")
+	var kept keptFlag
+	fs.Var(&kept, "kept", "only articles kept at least this many times (bare: 1)")
 	// A leading bare count has to come off before Parse; flag stops at the first
 	// non-flag argument, so anything after it would be silently ignored.
 	leading := -1
@@ -164,7 +175,7 @@ func cmdPick(args []string, open bool) error {
 			leading, args = v, args[1:]
 		}
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(joinKeptValue(args)); err != nil {
 		return err
 	}
 	count, err := resolvePickCount(leading, *n, fs.Args())
@@ -177,7 +188,7 @@ func cmdPick(args []string, open bool) error {
 		return errors.New("--starred and --unstarred are mutually exclusive")
 	}
 
-	filter := library.Filter{Folder: *folder, Domain: *domain}
+	filter := library.Filter{Folder: *folder, Domain: *domain, MinKept: int(kept)}
 	if filter.OlderThan, err = parseSpan(*olderThan); err != nil {
 		return err
 	}

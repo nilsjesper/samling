@@ -379,24 +379,44 @@ func (l *Library) UntagDone(id string) {
 	}
 }
 
-// MostKept returns up to n unread articles with a samlingN tag, highest count
-// first.
+// MostKept returns up to n unread articles with a samlingN tag, in Survivors
+// order.
 func (l *Library) MostKept(n int) []Bookmark {
+	out := l.Survivors(1)
+	if n >= 0 && len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// Survivors returns the unread articles kept at least minKept times, highest
+// count first. Within a count the oldest save comes first: of two articles
+// that survived as many triages, the one saved longer ago is the more overdue.
+// Articles with no save time go last, then ids break ties so the order is
+// stable from run to run.
+func (l *Library) Survivors(minKept int) []Bookmark {
+	if minKept < 1 {
+		minKept = 1 // zero would mean every article, which is not a survivor list
+	}
 	var out []Bookmark
 	for _, b := range l.Bookmarks {
-		if b.Kept() > 0 {
+		if b.Kept() >= minKept {
 			out = append(out, b)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if ki, kj := out[i].Kept(), out[j].Kept(); ki != kj {
-			return ki > kj
+		a, b := out[i], out[j]
+		if ka, kb := a.Kept(), b.Kept(); ka != kb {
+			return ka > kb
 		}
-		return out[i].ID < out[j].ID
+		if (a.Time > 0) != (b.Time > 0) {
+			return a.Time > 0
+		}
+		if a.Time != b.Time {
+			return a.Time < b.Time
+		}
+		return a.ID < b.ID
 	})
-	if n >= 0 && len(out) > n {
-		out = out[:n]
-	}
 	return out
 }
 
@@ -407,6 +427,7 @@ type Filter struct {
 	NewerThan time.Duration // saved at most this long ago
 	Domain    string        // hostname suffix match, e.g. "nytimes.com"
 	Starred   *bool         // nil matches all
+	MinKept   int           // kept (samlingN) at least this many times; 0 matches all
 }
 
 // Match reports whether b satisfies the filter.
@@ -415,6 +436,9 @@ func (f Filter) Match(b Bookmark) bool {
 		return false
 	}
 	if f.Starred != nil && b.Starred != *f.Starred {
+		return false
+	}
+	if f.MinKept > 0 && b.Kept() < f.MinKept {
 		return false
 	}
 	if f.OlderThan > 0 && b.Age() < f.OlderThan {

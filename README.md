@@ -73,6 +73,17 @@ its count over to the new copy, and the archived old copy loses its
 article's save time or its place in Unread. If a tag write fails, `sync` says
 so, carries on, and retries it next time.
 
+The counts work offline too. `samling survivors` lists every kept article,
+most-kept first and oldest first within a count; `--min 3` keeps it to the
+ones you've saved three times or more, and a bare number caps the list.
+`pick` and `list` take `--kept K` to choose only among articles kept at least
+K times (a bare `--kept` means once):
+
+```sh
+samling survivors 10          # the ten most stubborn articles
+samling pick 3 --kept 2       # three of the ones you've kept twice or more
+```
+
 To burn down a chunk you're never going to read, skip the browser entirely:
 
 ```sh
@@ -157,6 +168,7 @@ in again.
 | `samling pick N --no-open` | Same, without tabs — bulk-skip a chunk |
 | `samling list N` | Same selection as `pick`, printed instead of opened |
 | `samling status` | Unread / pending / archived counts, top domains, oldest article, most re-saved |
+| `samling survivors [N]` | List the articles you keep re-saving, most-kept first |
 | `samling undo` | Put the most recent pick back (before the next sync) |
 | `samling folders` | List your Instapaper folder ids |
 
@@ -171,10 +183,15 @@ samling pick --newer-than 7d               # only things saved this week
 samling pick --starred                     # or --unstarred
 samling list 10 --seed 42                  # reproducible shuffle
 samling pick --folder 1234567              # a folder id from `samling folders`
+samling pick 3 --kept 2                    # only articles re-saved twice or more
 ```
 
 Spans accept `d`, `w` and `y` on top of Go's duration syntax: `90d`, `2w`,
 `1y`, `36h`, `30m`.
+
+A number right after `--kept` is its value, so `samling pick --kept 2` picks
+one article kept at least twice. To combine a bare `--kept` with a count, put
+the count first: `samling pick 3 --kept`.
 
 ### Undo
 
