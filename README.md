@@ -82,11 +82,43 @@ samling sync
 
 `list` is the non-committing preview; `pick` always commits.
 
+## Dead links
+
+A backlog that reaches back a decade is full of articles whose pages are gone.
+Before opening tabs, `pick` checks the links it chose, all at once, with a
+5-second timeout. A pick is dead only on a clear signal: 404 or 410, a domain
+that no longer resolves, or a refused connection. Anything murkier (401, 403,
+429, 5xx, timeouts, TLS errors) counts as alive, since that's how bot-blocking
+sites like the NYT answer for pages that are fine. A link that redirects to its
+site's homepage is shown as "possibly dead" but still opened.
+
+Dead picks are replaced with fresh random picks that match the same filters,
+until there are enough live ones or the pool runs out:
+
+```
+skipped 2 dead links
+  How the Kindle Changed Reading (HTTP 404)
+    https://web.archive.org/web/http://example.com/2011/kindle
+  …
+They're marked read too; the next sync archives them and tags them samling-dead.
+```
+
+Nothing vanishes silently: a skipped pick is marked read like the rest of the
+batch (so `undo` puts it back too), and the next `sync` tags it `samling-dead`
+in Instapaper before archiving it, through the same retry queue as the
+`samlingN` counters. Instapaper often kept its own copy of the text, so a dead
+article may still be readable there.
+
+`list` checks too, but only reports. `pick --no-check` skips the check, and
+`pick --no-open` never checks, since nothing gets opened. Every result is
+appended to `~/.samling/linkcheck.log`, to see how often each case comes up.
+
 ## How it works
 
-Picking is **entirely offline**. `samling pick` reads a JSON file, chooses at
-random, and shells out to your browser — no network, no latency, works on a
-plane. Everything that touches Instapaper happens in one explicit `samling sync`.
+Picking never talks to Instapaper. `samling pick` reads a JSON file, chooses at
+random, checks the chosen links, and shells out to your browser. Everything
+that touches Instapaper happens in one explicit `samling sync`; `pick` only
+records what sync should do, such as the tags for dead links.
 
 Picked articles are **archived, never deleted**. They stay in your account and
 stay searchable. A tombstone list makes sure an article is never served up
@@ -155,6 +187,7 @@ in again.
 | `samling sync` | Archive what you've read, then refresh the local mirror |
 | `samling pick N` | Open N random unread articles, mark them read locally |
 | `samling pick N --no-open` | Same, without tabs — bulk-skip a chunk |
+| `samling pick N --no-check` | Open them without checking for dead links first |
 | `samling list N` | Same selection as `pick`, printed instead of opened |
 | `samling status` | Unread / pending / archived counts, top domains, oldest article, most re-saved |
 | `samling undo` | Put the most recent pick back (before the next sync) |
@@ -221,7 +254,8 @@ Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
 |---|---|
 | `config.json` | Your consumer key and secret |
 | `token.json` | Your access token (mode `0600`) |
-| `library.json` | The local mirror: unread, pending-archive, tombstones, and the sync cursor |
+| `library.json` | The local mirror: unread, pending-archive, tombstones, queued tags, and the sync cursor |
+| `linkcheck.log` | One line per link `pick` or `list` checked: time, verdict, reason, address |
 
 `library.json` is plain JSON and safe to read, grep, or back up. Writes are
 atomic, so an interrupted run can't corrupt it.
@@ -289,7 +323,8 @@ signature (checked against the worked example in RFC 5849 §3.4.1.1), and sync
 against a fake v2 server. That includes paging, the change feed and its
 deletions, re-saved keepers and their `samlingN` counters, picks archived
 elsewhere, migrating a v1 library, and the cursor advancing only after a
-successful sync.
+successful sync. The link checker runs against a local test server and a fake
+resolver, never real article addresses.
 
 ## Name
 

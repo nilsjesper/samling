@@ -427,3 +427,60 @@ func TestInFolderTreatsUnsetAsUnread(t *testing.T) {
 		t.Error("a folder bookmark should match its own folder only")
 	}
 }
+
+// pick draws dead-link replacements from one long shuffle and relies on its
+// first n matching a plain Pick(n) for the same seed, so list previews what
+// pick starts from.
+func TestPickPrefixIsStable(t *testing.T) {
+	l := seed(t, 10)
+	short := l.Pick(3, Filter{}, testRNG())
+	long := l.Pick(10, Filter{}, testRNG())
+	for i := range short {
+		if short[i].ID != long[i].ID {
+			t.Fatalf("Pick(3) = %v..., Pick(10) starts %v", short[i].ID, long[i].ID)
+		}
+	}
+}
+
+// pick queues samling-dead for sync; undoing the pick withdraws it, and the
+// queue survives a save. A file written before the queue existed loads with
+// none.
+func TestDeadTagQueue(t *testing.T) {
+	l := seed(t, 3)
+	l.MarkRead([]Bookmark{l.Bookmarks["a"], l.Bookmarks["b"]}, time.Now())
+	l.QueueTag("b", DeadTag)
+	l.QueueTag("b", DeadTag)
+	if got := len(l.PendingTags["b"]); got != 1 {
+		t.Errorf("queued %d tags for b, want 1", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "library.json")
+	if err := l.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	l, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := l.PendingTags["b"]; len(got) != 1 || got[0] != "samling-dead" {
+		t.Fatalf("queue after reload = %v", l.PendingTags)
+	}
+	if _, err := l.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	if l.PendingTags != nil {
+		t.Errorf("undo left %v queued", l.PendingTags)
+	}
+
+	old := filepath.Join(t.TempDir(), "old.json")
+	if err := os.WriteFile(old, []byte(`{"version":2,"bookmarks":{},"read":{},"archived":[],"pending_kept":{"7":2}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err = Load(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.PendingKept["7"] != 2 || l.PendingTags != nil {
+		t.Errorf("old file loaded as kept %v, tags %v", l.PendingKept, l.PendingTags)
+	}
+}

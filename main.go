@@ -96,6 +96,9 @@ Pick and list flags:
   --seed N           Reproducible shuffle
   --no-open          Mark read without opening tabs — burn down a chunk you
                      are never going to read (use 'list' to preview instead)
+  --no-check         Don't check links first. By default pick replaces picks
+                     whose link is dead (404, 410, no such domain) and sync
+                     tags them samling-dead; list only reports them
 
 Login flags:
   (none)             Sign in through your browser (OAuth 2). Needs
@@ -135,7 +138,8 @@ Setup:
   4. samling login && samling sync && samling pick 3
 
 State lives in ~/.samling (override with SAMLING_HOME).
-Picking is entirely offline; only 'sync', 'login' and 'folders' touch the network.
+Only 'sync', 'login' and 'folders' talk to Instapaper. 'pick' and 'list' fetch
+nothing but the picked articles' own addresses, to check the links.
 `)
 }
 
@@ -156,6 +160,7 @@ func cmdPick(args []string, open bool) error {
 	unstarred := fs.Bool("unstarred", false, "only unstarred articles")
 	seed := fs.Int64("seed", 0, "reproducible shuffle")
 	noOpen := fs.Bool("no-open", false, "print instead of opening")
+	noCheck := fs.Bool("no-check", false, "don't check links before opening")
 	// A leading bare count has to come off before Parse; flag stops at the first
 	// non-flag argument, so anything after it would be silently ignored.
 	leading := -1
@@ -208,8 +213,18 @@ func cmdPick(args []string, open bool) error {
 			seeded = true
 		}
 	})
-	picks := lib.Pick(*n, filter, newRNG(*seed, seeded))
-	if len(picks) == 0 {
+	// Links are checked only when someone will look at the result: pick with
+	// --no-open is a burn-down, and every pick is archived anyway.
+	var checked checkedPick
+	if !*noCheck && !(open && *noOpen) {
+		if checked, err = pickChecked(lib, filter, *n, newRNG(*seed, seeded), open); err != nil {
+			return err
+		}
+	} else {
+		checked.picks = lib.Pick(*n, filter, newRNG(*seed, seeded))
+	}
+	picks, dead := checked.picks, checked.dead
+	if len(picks) == 0 && len(dead) == 0 {
 		return errors.New("no unread articles match those filters")
 	}
 
@@ -222,7 +237,12 @@ func cmdPick(args []string, open bool) error {
 	// Commit the state change before opening anything, so an interrupted run
 	// can't serve the same article twice. `samling undo` reverses it.
 	if commit {
-		lib.MarkRead(picks, time.Now())
+		batch := append([]library.Bookmark{}, picks...)
+		for _, d := range dead {
+			batch = append(batch, d.Bookmark)
+		}
+		lib.MarkRead(batch, time.Now())
+		queueDeadTags(lib, dead)
 		if err := lib.Save(path); err != nil {
 			return err
 		}
@@ -233,6 +253,9 @@ func cmdPick(args []string, open bool) error {
 		if meta := describe(b); meta != "" {
 			fmt.Printf("    %s\n", meta)
 		}
+		if note := checked.notes[b.ID]; note != "" {
+			fmt.Printf("    %s\n", note)
+		}
 		if shouldOpen {
 			if err := browse.Open(b.URL); err != nil {
 				fmt.Fprintf(os.Stderr, "    warning: %v\n", err)
@@ -240,7 +263,12 @@ func cmdPick(args []string, open bool) error {
 		}
 	}
 
-	if commit {
+	reportDead(dead, commit)
+	if len(picks) < *n && len(dead) > 0 {
+		fmt.Printf("\nOnly %s with a live link matched those filters.\n", plural(len(picks), "article", "articles"))
+	}
+
+	if commit && len(picks) > 0 {
 		fmt.Printf("\n%s marked read locally; run `samling sync` to archive %s in Instapaper.\n",
 			plural(len(picks), "article", "articles"), pronoun(len(picks)))
 		fmt.Println("Re-save any you actually want to read — sync will spot it and keep them.")
