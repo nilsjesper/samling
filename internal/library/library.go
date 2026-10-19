@@ -145,6 +145,12 @@ type Library struct {
 	// count lives on the new copy. Names rather than the mirror's tags,
 	// because the old copy is archived and leaves the mirror.
 	PendingUntag map[string][]string `json:"pending_untag,omitempty"`
+	// PendingTags maps an article's id to plain tags still to add to it, such
+	// as DeadTag on a pick whose link was dead. pick queues them because it
+	// never talks to Instapaper; sync writes them alongside PendingKept and
+	// retries the same way. Optional, like the queues above, so older files
+	// load unchanged.
+	PendingTags map[string][]string `json:"pending_tags,omitempty"`
 
 	archived map[string]struct{} // index over Archived, built on load
 }
@@ -379,6 +385,32 @@ func (l *Library) UntagDone(id string) {
 	}
 }
 
+// DeadTag marks an article pick skipped because its link was dead, so the
+// skipped ones can be reviewed in Instapaper rather than vanishing silently.
+const DeadTag = "samling-dead"
+
+// QueueTag records that an article should carry tag, alongside any tags
+// already queued for it.
+func (l *Library) QueueTag(id, tag string) {
+	if l.PendingTags == nil {
+		l.PendingTags = map[string][]string{}
+	}
+	for _, t := range l.PendingTags[id] {
+		if t == tag {
+			return
+		}
+	}
+	l.PendingTags[id] = append(l.PendingTags[id], tag)
+}
+
+// TagsDone clears an article from the plain tag queue.
+func (l *Library) TagsDone(id string) {
+	delete(l.PendingTags, id)
+	if len(l.PendingTags) == 0 {
+		l.PendingTags = nil
+	}
+}
+
 // MostKept returns up to n unread articles with a samlingN tag, in Survivors
 // order.
 func (l *Library) MostKept(n int) []Bookmark {
@@ -505,7 +537,8 @@ func (l *Library) MarkRead(bs []Bookmark, now time.Time) string {
 }
 
 // Undo reverses the most recent pick batch, provided it has not been synced
-// yet. It returns the restored bookmarks.
+// yet. It returns the restored bookmarks. Plain tags queued for them go too:
+// only pick queues those (DeadTag), and undoing the pick withdraws them.
 func (l *Library) Undo() ([]Bookmark, error) {
 	if l.LastBatch == "" {
 		return nil, fmt.Errorf("nothing to undo")
@@ -515,6 +548,7 @@ func (l *Library) Undo() ([]Bookmark, error) {
 		if e.Batch == l.LastBatch {
 			l.Bookmarks[id] = e.Bookmark
 			delete(l.Read, id)
+			l.TagsDone(id)
 			restored = append(restored, e.Bookmark)
 		}
 	}

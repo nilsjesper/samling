@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -199,33 +200,45 @@ feed:
 	return nil
 }
 
-// markKept writes the samlingN tags that rescues queued, so that clicking
-// samling4 in Instapaper shows everything kept through four triages. It also
-// takes the samlingN off the old copy of a keeper that came back at a new
-// address, so the survivor isn't listed twice under its tag.
+// markKept writes the tags queued for sync: the samlingN tags that rescues
+// queued, so that clicking samling4 in Instapaper shows everything kept
+// through four triages, and plain tags such as samling-dead that pick queued
+// for dead links it skipped. It also takes the samlingN off the old copy of a
+// keeper that came back at a new address, so the survivor isn't listed twice
+// under its tag.
 //
 // It runs after the drain plan is applied, so each article's tags are as fresh
 // as this sync can make them. A failed write is reported and stays queued for
 // the next sync; it never fails this one, since the tag is a record of the
 // rescue and not the rescue itself. Only ctx cancellation is returned.
 //
-// Each write is one request that removes every samlingN tag the article has
-// and adds samling<target>. remove_tags takes ids, which the mirror does not
-// keep, so they come from one GET /tags per sync, made only when an old
-// samlingN has to come off. Tag names are unique per account, so a name is enough
-// to find its id. Rescues are a handful per sync, so the writes go one at a
-// time.
+// Each write is one request that removes every samlingN tag the article has,
+// adds samling<target>, and adds any plain tags queued for it. remove_tags
+// takes ids, which the mirror does not keep, so they come from one GET /tags
+// per sync, made only when an old samlingN has to come off. Tag names are
+// unique per account, so a name is enough to find its id. Rescues are a
+// handful per sync, so the writes go one at a time.
 func markKept(ctx context.Context, client *instapaper.Client, lib *library.Library, dryRun bool) error {
-	var todo []string
+	queued := map[string]bool{}
 	for id := range lib.PendingKept {
 		if _, ok := lib.Entry(id); ok {
-			todo = append(todo, id)
+			queued[id] = true
 		} else if !dryRun {
 			// Deleted, archived elsewhere, or moved out of every mirrored
 			// folder since it was rescued. Its tags are no longer visible
 			// here, so a swap cannot be worked out; let it go.
 			lib.KeptDone(id)
 		}
+	}
+	// A plain tag needs no swap, so it is written even once the article has
+	// left the mirror: a dead pick archived before its tag landed still gets
+	// it on the retry.
+	for id := range lib.PendingTags {
+		queued[id] = true
+	}
+	var todo []string
+	for id := range queued {
+		todo = append(todo, id)
 	}
 	var untag []string
 	for id := range lib.PendingUntag {
@@ -238,12 +251,8 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 	sort.Strings(untag)
 
 	if dryRun {
-		if len(todo) > 0 {
-			fmt.Printf("Would retry marking %s as kept:\n", plural(len(todo), "article", "articles"))
-		}
 		for _, id := range todo {
-			b, _ := lib.Entry(id)
-			fmt.Printf("  %s · %s\n", titleOf(b), keptTimes(lib.PendingKept[id]))
+			fmt.Printf("Would retry tagging %s\n", queuedTags(lib, id))
 		}
 		for _, id := range untag {
 			fmt.Printf("Would remove %s from %s, the old copy of a keeper\n",
@@ -253,7 +262,7 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 	}
 
 	if len(todo) > 0 {
-		fmt.Printf("Marking %s as kept...\n", plural(len(todo), "article", "articles"))
+		fmt.Printf("Tagging %s...\n", plural(len(todo), "article", "articles"))
 	} else {
 		fmt.Println("Updating samling tags...")
 	}
@@ -281,28 +290,43 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		b, _ := lib.Entry(id)
-		target := lib.PendingKept[id]
-		var lookup map[string]int64
-		if needsRemoval(b.Tags, target) {
-			var err error
-			if lookup, err = tagIDs(); err != nil {
-				failed++
-				fmt.Fprintf(os.Stderr, "  could not mark %s (%s) as kept: %v\n", id, titleOf(b), err)
-				continue
+		b, mirrored := lib.Entry(id)
+		var add []string
+		var remove []int64
+		if target, ok := lib.PendingKept[id]; ok {
+			var lookup map[string]int64
+			if needsRemoval(b.Tags, target) {
+				var err error
+				if lookup, err = tagIDs(); err != nil {
+					failed++
+					fmt.Fprintf(os.Stderr, "  could not tag %s (%s): %v\n", id, titleOf(b), err)
+					continue
+				}
+			}
+			add, remove = keptSwap(b.Tags, target, lookup)
+		}
+		for _, t := range lib.PendingTags[id] {
+			if !slices.Contains(b.Tags, t) {
+				add = append(add, t)
 			}
 		}
-		add, remove := keptSwap(b.Tags, target, lookup)
 		if len(add) == 0 && len(remove) == 0 {
 			// Already right, e.g. an earlier write whose response was lost.
 			lib.KeptDone(id)
+			lib.TagsDone(id)
 			done++
 			continue
 		}
 		after, err := client.TagBookmark(ctx, id, add, remove)
-		if err != nil {
+		var apiErr *instapaper.APIError
+		switch {
+		case !mirrored && errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound:
+			// Deleted since it left the mirror: nothing left to tag.
+			lib.TagsDone(id)
+			continue
+		case err != nil:
 			failed++
-			fmt.Fprintf(os.Stderr, "  could not mark %s (%s) as kept: %v\n", id, titleOf(b), err)
+			fmt.Fprintf(os.Stderr, "  could not tag %s (%s): %v\n", id, titleOf(b), err)
 			continue
 		}
 		names := make([]string, 0, len(after))
@@ -313,6 +337,7 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 		// status show the new count before the next sync reads it back.
 		lib.SetTags(id, names)
 		lib.KeptDone(id)
+		lib.TagsDone(id)
 		done++
 	}
 
@@ -361,12 +386,26 @@ func markKept(ctx context.Context, client *instapaper.Client, lib *library.Libra
 		lib.UntagDone(id)
 	}
 
-	fmt.Printf("  marked %d", done)
+	fmt.Printf("  tagged %d", done)
 	if failed > 0 {
 		fmt.Printf(", %d failed (left queued, will retry next sync)", failed)
 	}
 	fmt.Println()
 	return nil
+}
+
+// queuedTags describes what is queued for id, for a dry run.
+func queuedTags(lib *library.Library, id string) string {
+	var what []string
+	if n, ok := lib.PendingKept[id]; ok {
+		what = append(what, keptTimes(n))
+	}
+	what = append(what, lib.PendingTags[id]...)
+	name := id
+	if b, ok := lib.Entry(id); ok {
+		name = titleOf(b)
+	}
+	return name + " · " + strings.Join(what, ", ")
 }
 
 // keptSwap works out the tag request that leaves an article carrying exactly
