@@ -40,11 +40,6 @@ browser extension. Then:
 samling sync      # archives the batch, keeps the re-saves
 ```
 
-Each re-saved article stays in Unread and gets a counter tag in Instapaper:
-`samling1` the first time you keep it, then `samling2`, and so on. Click
-`samling4` in Instapaper to see everything you've kept four times.
-`samling survivors` lists the same thing locally.
-
 To clear old articles without reading them:
 
 ```sh
@@ -56,6 +51,36 @@ samling sync
 `samling undo` puts the last pick back, as long as you haven't synced since.
 `pick` marks articles read before it opens anything, so use `undo` after an
 interrupted pick too. After a sync, unarchive in Instapaper.
+
+## Keeping articles
+
+To keep an article you picked, re-save it with the Instapaper browser
+extension before the next `sync`. Sync sees the re-save and leaves the article
+in Unread instead of archiving it. It goes back into the pool, so a later pick
+can serve it again. This works even when the re-save lands at a different
+address (see [Sync](#sync)).
+
+I noticed some articles kept coming up in picks and I re-saved them every
+time. That seemed worth tracking: an article I keep re-saving is probably one I
+want to read when I get around to it, so samling counts them.
+
+Each keep adds one to the article's count. The count lives in Instapaper as a
+tag: `samling1` after the first keep, `samling2` after the second, and so on.
+An article only ever has its latest tag. `pick`, `list`, `sync` and
+`survivors` show the count as `kept ×2`.
+
+```sh
+samling survivors           # every kept article, most-kept first
+samling survivors --min 3   # only articles kept 3 or more times
+samling pick 3 --kept 2     # pick 3 from articles kept at least twice
+```
+
+In Instapaper, click a tag such as `samling4` to see every article kept four
+times.
+
+A number right after `--kept` is its value: `samling pick --kept 2` picks one
+article. For three articles kept at least once, put the count first:
+`samling pick 3 --kept`.
 
 ## Commands
 
@@ -85,17 +110,12 @@ interrupted pick too. After a sync, unarchive in Instapaper.
 --no-check             # skip the dead-link check
 ```
 
-A number right after `--kept` is its value: `samling pick --kept 2` picks one
-article. For three articles kept at least once, put the count first:
-`samling pick 3 --kept`.
-
 Other flags:
 
 ```sh
 samling sync --full          # re-read the folder and drop anything missing; fixes a mirror that looks wrong
 samling sync --dry-run       # show what sync would do
 samling sync --concurrency 8 # parallel archive requests (default 4)
-samling survivors --min 3    # only articles kept 3+ times
 samling status --domains 10  # top domains to show (default 5, 0 for none)
 ```
 
