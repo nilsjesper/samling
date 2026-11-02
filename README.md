@@ -1,334 +1,219 @@
 # samling
 
-Shuffle your way through an Instapaper backlog.
-
-`samling` keeps a local mirror of your unread list, picks articles out of it at
-random, opens them in your browser, and archives what you've read on the next
-sync. It exists because a reading list is ordered and the top of it goes stale,
-so a large backlog just sits there getting larger.
-
-It's a port of the idea behind [pickpocket][] — a Pocket CLI that died with
-Pocket in July 2025 — to Instapaper, with the destructive parts removed.
-
-[pickpocket]: https://github.com/tiagoamaro/pickpocket-rust
-
-```
-$ samling status
-1,847 unread
-0 pending archive
-312 archived
-
-Last synced 2 hours ago
-Oldest unread is 4 years old: The Cathedral and the Bazaar
-
-Top domains:
-    204  nytimes.com
-    118  theatlantic.com
-     97  longreads.com
-
-$ samling pick 3
- 1. A Brief History of the Interrobang
-    https://www.theatlantic.com/…
-    theatlantic.com · saved 2 years ago
- 2. …
-```
-
-## The triage loop
-
-The way this actually gets used:
-
-```sh
-samling pick 20       # opens 20 tabs
-```
-
-Work through the tabs. Close the ones you don't care about. For the ones you
-*do* want to read, hit the Instapaper extension to re-save them — which also
-floats them to the top of your Unread list.
-
-```sh
-samling sync          # archives the batch, keeps the ones you re-saved
-```
-
-samling detects the re-saves and leaves them alone. Re-saving the same URL
-reuses an article's `bookmark_id`, so without that detection your keepers
-would be archived by the very sync that follows, or stay tombstoned and never
-be served again. A deliberate re-save always outranks samling's bookkeeping.
-
-Old articles often redirect (to `https`, to or from `www`, or to a new path),
-and the extension saves the address it lands on. Instapaper then makes a new
-bookmark instead. samling matches a new bookmark saved after a pick back to
-that pick when they're on the same site and have the same address (ignoring
-scheme, `www`, query and trailing slash) or the same title (ignoring case,
-punctuation and a ` | Site` suffix). It archives the old copy so the article
-isn't in the pool twice, and reports the new one as kept "(re-saved at a new
-address)".
-
-Each keeper also gets a counter tag in Instapaper: `samling1` the first time
-you keep it, then `samling2`, `samling3` and so on, swapped in place so an
-article only ever has one. Click `samling4` in Instapaper to see everything
-that survived four triages. A keeper that came back at a new address carries
-its count over to the new copy, and the archived old copy loses its
-`samlingN` (only that tag), so each survivor shows up once. Kept articles stay in the pick pool, and `pick`,
-`list` and `status` show the count (`kept ×3`). Tagging doesn't change an
-article's save time or its place in Unread. If a tag write fails, `sync` says
-so, carries on, and retries it next time.
-
-The counts work offline too. `samling survivors` lists every kept article,
-most-kept first and oldest first within a count; `--min 3` keeps it to the
-ones you've saved three times or more, and a bare number caps the list.
-`pick` and `list` take `--kept K` to choose only among articles kept at least
-K times (a bare `--kept` means once):
-
-```sh
-samling survivors 10          # the ten most stubborn articles
-samling pick 3 --kept 2       # three of the ones you've kept twice or more
-```
-
-To burn down a chunk you're never going to read, skip the browser entirely:
-
-```sh
-samling pick 100 --older-than 1y --no-open
-samling sync
-```
-
-`list` is the non-committing preview; `pick` always commits.
-
-## Dead links
-
-A backlog that reaches back a decade is full of articles whose pages are gone.
-Before opening tabs, `pick` checks the links it chose, all at once, with a
-5-second timeout. A pick is dead only on a clear signal: 404 or 410, a domain
-that no longer resolves, or a refused connection. Anything murkier (401, 403,
-429, 5xx, timeouts, TLS errors) counts as alive, since that's how bot-blocking
-sites like the NYT answer for pages that are fine. A link that redirects to its
-site's homepage is shown as "possibly dead" but still opened.
-
-Dead picks are replaced with fresh random picks that match the same filters,
-until there are enough live ones or the pool runs out:
-
-```
-skipped 2 dead links
-  How the Kindle Changed Reading (HTTP 404)
-    https://web.archive.org/web/http://example.com/2011/kindle
-  …
-They're marked read too; the next sync archives them and tags them samling-dead.
-```
-
-Nothing vanishes silently: a skipped pick is marked read like the rest of the
-batch (so `undo` puts it back too), and the next `sync` tags it `samling-dead`
-in Instapaper before archiving it, through the same retry queue as the
-`samlingN` counters. Instapaper often kept its own copy of the text, so a dead
-article may still be readable there.
-
-`list` checks too, but only reports. `pick --no-check` skips the check, and
-`pick --no-open` never checks, since nothing gets opened. Every result is
-appended to `~/.samling/linkcheck.log`, to see how often each case comes up.
-
-## How it works
-
-Picking never talks to Instapaper. `samling pick` reads a JSON file, chooses at
-random, checks the chosen links, and shells out to your browser. Everything
-that touches Instapaper happens in one explicit `samling sync`; `pick` only
-records what sync should do, such as the tags for dead links.
-
-Picked articles are **archived, never deleted**. They stay in your account and
-stay searchable. A tombstone list makes sure an article is never served up
-twice, even if a later sync still reports it as unread.
+Open random articles from your Instapaper Unread list, then archive them on the
+next sync. A port of [pickpocket](https://github.com/tiagoamaro/pickpocket-rust)
+(a Pocket CLI that died with Pocket in July 2025) that archives instead of
+deleting.
 
 ## Install
 
 ```sh
-go install github.com/nilsjesper/samling@latest
+go install github.com/nilsjesper/samling@latest   # or, from a checkout: go build -o samling .
 ```
 
-Or build from a checkout: `go build -o samling .`
+## Set up
 
-## Setup
-
-1. **Create an Instapaper application** at
-   <https://www.instapaper.com/developers/applications/create>. A new
-   application starts in "Owner Only" mode and works right away for your own
-   account; Instapaper's human review is only needed before other people can
-   sign in with it.
-
-2. **Sign in.** Pick one:
-
-   - **Access token (simplest).** On your application's page under
-     [Applications](https://www.instapaper.com/developers/applications), select
-     "Generate access token", then run `samling login --token` and paste it at
-     the (hidden) prompt, or pipe it in: `pbpaste | samling login --token`.
-     It's never accepted as an argument, so it stays out of your shell
-     history. Nothing else is needed: no consumer key, no `config.json`. One
-     token works on every machine, but regenerating it revokes the old one
-     everywhere.
-   - **Browser sign-in.** Give samling the application's consumer key and
-     secret, in `~/.samling/config.json`:
-
-     ```json
-     { "consumer_key": "…", "consumer_secret": "…" }
-     ```
-
-     or via `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`, which take
-     precedence. On the application's page, add
-     `http://127.0.0.1:8919/callback` to the Callback URIs (Instapaper only
-     accepts a local callback while the application is "Owner Only"). Then
-     `samling login` opens the consent page and catches the redirect on that
-     port. If 8919 is taken, use `samling login --port N` and register that
-     port's URI instead.
-
-3. **Sync and pick.**
+1. Create an Instapaper application at
+   <https://www.instapaper.com/developers/applications/create>. It works for
+   your own account straight away.
+2. On the application's page, select "Generate access token" and copy it.
+3. Save the token and do the first sync, which reads your whole Unread list:
 
    ```sh
-   samling sync     # the first sync reads your whole unread list
-   samling pick 3
+   pbpaste | samling login --token   # or run without the pipe and paste at the hidden prompt
+   samling sync
    ```
 
-Either way, samling never sees your password. `login` checks the token with a
-cheap API call before saving it, and only the token is stored.
+One token works on every machine. Generating a new one revokes the old one.
+To sign in through the browser instead, see [Browser sign-in](#browser-sign-in).
 
-The old password login is still there as `samling login --password`. It uses
-xAuth, which Instapaper turns off for new sign-ins on **2027-09-30**; tokens it
-already issued keep working after that, so existing installs don't need to log
-in again.
+## Triage
+
+```sh
+samling pick 20   # opens 20 random unread articles in tabs
+```
+
+Close the tabs you don't want. Re-save the ones you do with the Instapaper
+browser extension. Then:
+
+```sh
+samling sync      # archives the batch, keeps the re-saves
+```
+
+Each re-saved article stays in Unread and gets a counter tag in Instapaper:
+`samling1` the first time you keep it, then `samling2`, and so on. Click
+`samling4` in Instapaper to see everything you've kept four times.
+`samling survivors` lists the same thing locally.
+
+To clear old articles without reading them:
+
+```sh
+samling list 100 --older-than 1y             # preview, changes nothing
+samling pick 100 --older-than 1y --no-open   # mark read without opening
+samling sync
+```
+
+`samling undo` puts the last pick back, as long as you haven't synced since.
+`pick` marks articles read before it opens anything, so use `undo` after an
+interrupted pick too. After a sync, unarchive in Instapaper.
 
 ## Commands
 
-| | |
+| Command | |
 |---|---|
-| `samling login` | Sign in through the browser and save an access token |
-| `samling login --token` | Save a token from "Generate access token" instead |
-| `samling sync` | Archive what you've read, then refresh the local mirror |
-| `samling pick N` | Open N random unread articles, mark them read locally |
-| `samling pick N --no-open` | Same, without tabs — bulk-skip a chunk |
-| `samling pick N --no-check` | Open them without checking for dead links first |
-| `samling list N` | Same selection as `pick`, printed instead of opened |
-| `samling status` | Unread / pending / archived counts, top domains, oldest article, most re-saved |
-| `samling survivors [N]` | List the articles you keep re-saving, most-kept first |
-| `samling undo` | Put the most recent pick back (before the next sync) |
-| `samling folders` | List your Instapaper folder ids |
+| `samling login` | Sign in and save an access token |
+| `samling sync` | Archive picked articles, then refresh the local mirror |
+| `samling pick N` | Open N random unread articles and mark them read locally |
+| `samling list N` | Same selection as `pick`, printed, nothing marked |
+| `samling status` | Counts, top domains, oldest article, most re-saved |
+| `samling survivors [N]` | Articles you've kept, most-kept first |
+| `samling undo` | Put the last pick back (before the next sync) |
+| `samling folders` | List your folder ids |
+| `samling help` | Usage and flags |
 
-### Filters
-
-`pick` and `list` take the same filters:
+`pick` and `list` filters:
 
 ```sh
-samling pick 5 --older-than 1y             # dig into the deep backlog
-samling pick --domain nytimes.com          # matches subdomains too
-samling pick --newer-than 7d               # only things saved this week
-samling pick --starred                     # or --unstarred
-samling list 10 --seed 42                  # reproducible shuffle
-samling pick --folder 1234567              # a folder id from `samling folders`
-samling pick 3 --kept 2                    # only articles re-saved twice or more
+--older-than 1y        # spans: 30m, 36h, 90d, 2w, 1y
+--newer-than 7d
+--domain nytimes.com   # includes subdomains
+--starred              # or --unstarred
+--folder 1234567       # id from `samling folders`; needs `samling sync --folder 1234567` first
+--kept 2               # only articles kept at least twice; bare --kept means once
+--seed 42              # reproducible shuffle
+--no-open              # pick only: mark read without opening or checking links
+--no-check             # skip the dead-link check
 ```
 
-Spans accept `d`, `w` and `y` on top of Go's duration syntax: `90d`, `2w`,
-`1y`, `36h`, `30m`.
+A number right after `--kept` is its value: `samling pick --kept 2` picks one
+article. For three articles kept at least once, put the count first:
+`samling pick 3 --kept`.
 
-A number right after `--kept` is its value, so `samling pick --kept 2` picks
-one article kept at least twice. To combine a bare `--kept` with a count, put
-the count first: `samling pick 3 --kept`.
-
-### Undo
-
-`pick` commits its state change before opening anything, so an interrupted run
-can't serve the same article twice. If you didn't mean it:
+Other flags:
 
 ```sh
-samling undo
+samling sync --full          # re-read the folder and drop anything missing; fixes a mirror that looks wrong
+samling sync --dry-run       # show what sync would do
+samling sync --concurrency 8 # parallel archive requests (default 4)
+samling survivors --min 3    # only articles kept 3+ times
+samling status --domains 10  # top domains to show (default 5, 0 for none)
 ```
 
-That only works before the next `sync`. Once an article has actually been
-archived in Instapaper, unarchive it there.
+## Dead links
 
-## How sync works
+Before opening tabs, `pick` checks its links (5-second timeout) and replaces
+dead ones with new random picks that match the same filters. If the pool runs
+out, you get fewer than you asked for. A link is dead
+only on 404, 410, a domain that no longer resolves, or a refused connection.
+Everything else (401, 403, 429, 5xx, timeouts, TLS errors) counts as alive,
+because bot-blocking sites like the NYT answer that way for live pages. A link
+that redirects to a front page (`/`), even on another site, is flagged
+"possibly dead" and opened anyway.
 
-The first sync reads your whole Unread list, however long it is, a page of 500
-at a time:
+Skipped picks are marked read with the rest of the batch, so `undo` restores
+them. The next sync tags them `samling-dead` and archives them. Instapaper may
+still have the article text.
 
+`list` reports dead links without replacing them. Every check is logged to
+`~/.samling/linkcheck.log`.
+
+## Sync
+
+`pick` never talks to Instapaper. It reads the local mirror and records what
+sync should do.
+
+The first sync reads all of Unread, 500 articles per request. Later syncs fetch
+only what changed, usually in one request. Articles you archived, deleted or
+moved elsewhere drop out of the mirror.
+
+Picked articles are archived, never deleted. A local tombstone list stops an
+article from being picked twice.
+
+Re-saving an old article often saves a redirected address, which Instapaper
+treats as a new bookmark. Sync matches a bookmark saved after the pick back to
+it when both are on the same site and share an address (ignoring scheme, `www`,
+query and trailing slash), or one title contains the other (ignoring case,
+punctuation and a trailing ` | Site` or ` - Site`). It archives the old copy,
+removes its `samlingN` tag, tags the new copy with the next count up, and
+reports it as "re-saved at a new address".
+
+Tagging doesn't change an article's place in Unread. A failed tag write is
+reported and retried on the next sync.
+
+`samling sync --folder 1234567` adds one of your folders to the mirror, and it
+stays synced from then on. Starred is a filter, not a folder. The Archive isn't
+mirrored.
+
+## Browser sign-in
+
+Put the application's consumer key and secret in `~/.samling/config.json`:
+
+```json
+{ "consumer_key": "...", "consumer_secret": "..." }
 ```
-$ samling sync
-Reading all of unread...
-  add 23,371 new articles, refresh 487, drop 7 articles no longer in unread
-```
 
-After that, a sync asks Instapaper only for what changed since the last one,
-which usually takes a single request. New saves come in; articles you archived,
-deleted or moved to another folder elsewhere drop out; a pick you already
-archived from your phone is simply forgotten, with no request sent.
+`INSTAPAPER_CONSUMER_KEY` and `INSTAPAPER_CONSUMER_SECRET` override the file.
 
-`samling sync --full` re-reads the whole folder. You shouldn't need it, but it
-is the cure if the mirror ever seems out of step: a full read is a snapshot, so
-anything it doesn't return is removed from the mirror.
+Add `http://127.0.0.1:8919/callback` to the application's Callback URIs, then
+run `samling login`. Instapaper only accepts a local callback while the
+application is in "Owner Only" mode, which is the default. If port 8919 is
+taken, use `--port N` and register that port instead. `--no-open` prints the
+sign-in URL instead of opening it.
 
-`samling sync --folder 1234567` mirrors one of your own folders as well (ids
-from `samling folders`), and `pick --folder 1234567` picks from it. Every
-folder synced this way stays current from then on, whichever one you name.
-Starred isn't a folder (use `pick --starred`), and the Archive isn't mirrored.
+`samling login --password` uses the old username/password exchange (xAuth),
+which Instapaper turns off for new sign-ins on 2027-09-30. Tokens it already
+issued keep working.
+
+samling never stores your password. `login` tests the token before saving it.
 
 ## Files
 
 Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
 
-| file | |
+| File | |
 |---|---|
-| `config.json` | Your consumer key and secret (only for browser sign-in and `--password`) |
-| `token.json` | Your access token (mode `0600`) |
-| `library.json` | The local mirror: unread, pending-archive, tombstones, queued tags, and the sync cursor |
-| `linkcheck.log` | One line per link `pick` or `list` checked: time, verdict, reason, address |
+| `config.json` | Consumer key and secret (browser sign-in and `--password` only) |
+| `token.json` | Access token (mode `0600`) |
+| `library.json` | The mirror: unread, pending archive, tombstones, queued tags, sync cursor |
+| `linkcheck.log` | One line per link checked: time, verdict, reason, address |
 
-`library.json` is plain JSON and safe to read, grep, or back up. Writes are
-atomic, so an interrupted run can't corrupt it.
+`library.json` is plain JSON and written atomically.
 
-## Notes on the Instapaper API
+## Instapaper API notes
 
-Things worth knowing if you plan to hack on this:
+For anyone changing the sync code:
 
-- **Two API versions.** Sync, archiving and `folders` use API v2 (`/api/2/`):
-  JSON, `GET` for reads, and the access token as a plain
-  `Authorization: Bearer` header. `login` signs in with OAuth 2 by default;
-  `login --password` keeps v1's xAuth exchange until it is turned off. An xAuth
-  token works unchanged as a v2 bearer token (verified live); its secret goes
-  unused.
-- **v1 couldn't see past 500.** v1's `bookmarks/list` read only the newest 500
-  articles of a folder and had no offset. Its `have` parameter looked like
-  pagination but filtered *after* the limit was applied. On a 23,858-article
-  backlog, samling's mirror held 494 of them. v2 has real `offset` paging and
-  reports the section's `total`.
-- **The `since` feed is account-wide.** `GET /api/2/bookmarks?since=T` returns
-  every bookmark changed after `T` in any section, archived ones included
-  (`archived: true`), plus `deleted_ids`. A tag-only change shows up too, with
-  `time` unchanged. Bookmarks and deleted ids share each page's `limit`, so the
-  offset advances by both. samling stores the time just *before* each sync
-  started, minus ten minutes for clock skew, as the next `since`. Reading a
-  change twice is harmless; missing one is not.
-- **Re-saving reuses the bookmark id, but only for an identical URL**, and
-  refreshes the article's `time`. That timestamp is the only way to tell "I
-  re-saved this during triage" from "this is still queued for archiving",
-  which is why `sync` fetches before it archives. A re-save from the browser
-  extension uses the address the page redirects to, so an old article often
-  comes back as a new bookmark under a new id (seen live: two of three
-  re-saves in one triage). `sync` matches those by site plus address or title. (v2 `id` is the same number as v1 `bookmark_id`, so libraries from
-  older versions of samling carry straight over.)
-- **Offset paging isn't a snapshot.** If an article leaves Unread while a full
-  read is paging through it, everything shifts up one place and one article is
-  skipped, and dropped from the mirror until the next `sync --full`. It takes
-  about 48 requests to read 24,000 articles, so the window for this is small.
-- **Tags are swapped by id.** `POST /api/2/bookmarks/{id}/tags` takes
-  `add_tags` by name (creating a tag that doesn't exist yet) and `remove_tags`
-  by id only, in one request, and answers with the article's full tag list.
-  The mirror stores tag names, so when an old `samlingN` has to come off, sync
-  reads `GET /api/2/tags` once to find its id. Tagging leaves `time` alone, and
-  tags survive a re-save from the browser extension (both verified live).
-  There's no endpoint for deleting a tag, so an old `samlingN` nobody carries
-  any more lingers in the tag list until you remove it in the web app.
-- **No bulk actions.** Unlike Pocket, archiving is one request per article
-  (`POST /api/2/bookmarks/{id}/move`), so `sync` uses a small worker pool
-  (`--concurrency`, default 4) and saves progress as it goes.
-- **Errors are real HTTP statuses** with `{"error": {"code", "message"}}`.
-  samling retries 5xx, 429 (honouring `Retry-After`, capped at a minute), and
-  bodies that aren't JSON, which is how a maintenance page shows up.
-- **No word count** in the bookmark object. Reading-time filters would need a
-  `GET /api/2/bookmarks/{id}/parse` per article; not implemented.
+- Sync, archiving, tags and `folders` use API v2 (`/api/2/`) with
+  `Authorization: Bearer`. `login` uses OAuth 2. `login --password` uses v1
+  xAuth, and its token works unchanged as a v2 bearer token (verified live).
+- v1 `bookmarks/list` returned only the newest 500 articles, with no offset.
+  Its `have` parameter filtered after that limit. v2 has `offset` and reports
+  `total`.
+- `GET /api/2/bookmarks?since=T` is account-wide: every changed bookmark in any
+  section (archived ones carry `archived: true`), tag-only changes (with `time`
+  unchanged), and `deleted_ids`. Bookmarks and deleted ids share each page's
+  `limit`, so advance the offset by both. samling stores the sync start time
+  minus ten minutes as the next `since`, since reading a change twice is
+  harmless and missing one isn't.
+- Re-saving an identical URL keeps the id and updates `time`. That's the only
+  way to tell a keeper from a pick waiting to be archived, so sync fetches
+  before it archives. A redirected URL gets a new id (two of three re-saves in
+  one live triage).
+- v2 `id` equals v1 `bookmark_id`, so libraries from older versions carry over.
+- Offset paging isn't a snapshot. An article leaving Unread during a full read
+  shifts the pages, and one article is missed until the next `sync --full`.
+- `POST /api/2/bookmarks/{id}/tags` adds tags by name and removes them by id
+  only, so sync looks ids up once with `GET /api/2/tags`. Tagging leaves `time`
+  alone, and tags survive a re-save (both verified live). There's no endpoint
+  for deleting a tag, so unused `samlingN` tags stay until you remove them in
+  the web app.
+- Archiving is one `POST /api/2/bookmarks/{id}/move` per article, run in
+  parallel (`--concurrency`), with progress saved as it goes.
+- Errors are real HTTP statuses with `{"error": {"code", "message"}}`. samling
+  retries 5xx, 429 (honouring `Retry-After`, capped at a minute) and non-JSON
+  bodies, which is how a maintenance page shows up.
+- Bookmarks have no word count. Reading-time filters would need
+  `GET /api/2/bookmarks/{id}/parse` per article.
 
 ## Development
 
@@ -337,19 +222,9 @@ go test ./...
 go vet ./...
 ```
 
-The tests cover the things most likely to break silently: the OAuth 1.0a
-signature (checked against the worked example in RFC 5849 §3.4.1.1), the OAuth 2
-sign-in (state checks, code exchange and its errors, against a fake server), and sync
-against a fake v2 server. That includes paging, the change feed and its
-deletions, re-saved keepers and their `samlingN` counters, picks archived
-elsewhere, migrating a v1 library, and the cursor advancing only after a
-successful sync. The link checker runs against a local test server and a fake
-resolver, never real article addresses.
+Tests use fake servers and a fake DNS resolver. Nothing calls Instapaper or real
+article addresses.
 
 ## Name
 
-Norwegian, Danish and Swedish for "collection".
-
-## License
-
-MIT
+Norwegian, Danish and Swedish for "collection". MIT licensed.
