@@ -622,8 +622,9 @@ func (l *Library) Stats(topDomains int) Stats {
 		}
 		return s.Domains[i].Host < s.Domains[j].Host
 	})
-	if topDomains > 0 && len(s.Domains) > topDomains {
-		s.Domains = s.Domains[:topDomains]
+	// topDomains <= 0 means no domains, matching `status --domains 0`.
+	if len(s.Domains) > max(topDomains, 0) {
+		s.Domains = s.Domains[:max(topDomains, 0)]
 	}
 	return s
 }

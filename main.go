@@ -105,6 +105,9 @@ Pick and list flags:
                      whose link is dead (404, 410, no such domain) and sync
                      tags them samling-dead; list only reports them
 
+Status flags:
+  --domains N        How many top domains to show (default 5, 0 for none)
+
 Survivors flags:
   N                  Show at most N (default all)
   --min K            Only articles kept at least K times (default 1)

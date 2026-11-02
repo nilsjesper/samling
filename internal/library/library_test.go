@@ -318,6 +318,12 @@ func TestStats(t *testing.T) {
 	if s.Oldest == nil || s.Oldest.ID != "1" {
 		t.Errorf("oldest = %+v, want id 1", s.Oldest)
 	}
+	if got := l.Stats(1).Domains; len(got) != 1 {
+		t.Errorf("Stats(1) domains = %+v, want 1", got)
+	}
+	if got := l.Stats(0).Domains; len(got) != 0 {
+		t.Errorf("Stats(0) domains = %+v, want none", got)
+	}
 }
 
 // A library written by the v1 schema must load, keep everything the user has
