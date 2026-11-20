@@ -7,7 +7,9 @@ random, opens them in your browser, and archives what you've read on the next
 sync. It exists because a reading list is ordered and the top of it goes stale,
 so a large backlog just sits there getting larger.
 
-It's a port of the idea behind [pickpocket][] — a Pocket CLI that died with
+## Inspiration
+
+This is a port of the idea behind [pickpocket][] — a Pocket CLI that died with
 Pocket in July 2025 — to Instapaper, with the destructive parts removed.
 
 [pickpocket]: https://github.com/tiagoamaro/pickpocket-rust
@@ -28,8 +30,8 @@ Top domains:
 
 $ samling pick 3
  1. A Brief History of the Interrobang
-    https://www.theatlantic.com/…
-    theatlantic.com · saved 2 years ago
+     https://www.theatlantic.com/…
+     theatlantic.com · saved 2 years ago
  2. …
 ```
 
@@ -137,21 +139,20 @@ twice, even if a later sync still reports it as unread.
 
 ## Install
 
-With Homebrew (macOS or Linux):
-
 ```sh
+# Homebrew (macOS or Linux)
 brew install nilsjesper/tap/samling
-```
 
-Or download a binary for macOS, Linux or Windows from
-[Releases](https://github.com/nilsjesper/samling/releases), or, with Go:
+# Or download a binary for macOS, Linux, Windows from Releases
+# https://github.com/nilsjesper/samling/releases
 
-```sh
+# Or with Go
 go install github.com/nilsjesper/samling@latest
-```
 
-Or build from a checkout: `go build -o samling .` `samling version` says which
-one you have.
+# Or build from source
+go build -o samling .
+samling version
+```
 
 The release binaries aren't signed. The Homebrew install clears macOS's
 quarantine flag for you; for a downloaded binary, run
@@ -159,11 +160,14 @@ quarantine flag for you; for a downloaded binary, run
 
 ## Setup
 
-1. **Create an Instapaper application** at
-   <https://www.instapaper.com/developers/applications/create>. A new
-   application starts in "Owner Only" mode and works right away for your own
-   account; Instapaper's human review is only needed before other people can
-   sign in with it.
+**You create your own Instapaper application** (takes ~30 seconds). This keeps
+your credentials yours — no shared keys, no rate-limit contention, no third
+party in the loop. A new application starts in "Owner Only" mode and works
+right away for your own account; Instapaper's human review is only needed
+before *other people* can sign in with it.
+
+1. **Create the application** at
+   <https://www.instapaper.com/developers/applications/create>
 
 2. **Sign in.** Pick one:
 
@@ -175,6 +179,7 @@ quarantine flag for you; for a downloaded binary, run
      history. Nothing else is needed: no consumer key, no `config.json`. One
      token works on every machine, but regenerating it revokes the old one
      everywhere.
+
    - **Browser sign-in.** Give samling the application's consumer key and
      secret, in `~/.samling/config.json`:
 
@@ -207,7 +212,7 @@ in again.
 
 ## Commands
 
-| | |
+| Command | Description |
 |---|---|
 | `samling login` | Sign in through the browser and save an access token |
 | `samling login --token` | Save a token from "Generate access token" instead |
@@ -294,57 +299,6 @@ Everything lives in `~/.samling`, or `$SAMLING_HOME` if set.
 `library.json` is plain JSON and safe to read, grep, or back up. Writes are
 atomic, so an interrupted run can't corrupt it.
 
-## Notes on the Instapaper API
-
-Things worth knowing if you plan to hack on this:
-
-- **Two API versions.** Sync, archiving and `folders` use API v2 (`/api/2/`):
-  JSON, `GET` for reads, and the access token as a plain
-  `Authorization: Bearer` header. `login` signs in with OAuth 2 by default;
-  `login --password` keeps v1's xAuth exchange until it is turned off. An xAuth
-  token works unchanged as a v2 bearer token (verified live); its secret goes
-  unused.
-- **v1 couldn't see past 500.** v1's `bookmarks/list` read only the newest 500
-  articles of a folder and had no offset. Its `have` parameter looked like
-  pagination but filtered *after* the limit was applied. On a 23,858-article
-  backlog, samling's mirror held 494 of them. v2 has real `offset` paging and
-  reports the section's `total`.
-- **The `since` feed is account-wide.** `GET /api/2/bookmarks?since=T` returns
-  every bookmark changed after `T` in any section, archived ones included
-  (`archived: true`), plus `deleted_ids`. A tag-only change shows up too, with
-  `time` unchanged. Bookmarks and deleted ids share each page's `limit`, so the
-  offset advances by both. samling stores the time just *before* each sync
-  started, minus ten minutes for clock skew, as the next `since`. Reading a
-  change twice is harmless; missing one is not.
-- **Re-saving reuses the bookmark id, but only for an identical URL**, and
-  refreshes the article's `time`. That timestamp is the only way to tell "I
-  re-saved this during triage" from "this is still queued for archiving",
-  which is why `sync` fetches before it archives. A re-save from the browser
-  extension uses the address the page redirects to, so an old article often
-  comes back as a new bookmark under a new id (seen live: two of three
-  re-saves in one triage). `sync` matches those by site plus address or title. (v2 `id` is the same number as v1 `bookmark_id`, so libraries from
-  older versions of samling carry straight over.)
-- **Offset paging isn't a snapshot.** If an article leaves Unread while a full
-  read is paging through it, everything shifts up one place and one article is
-  skipped, and dropped from the mirror until the next `sync --full`. It takes
-  about 48 requests to read 24,000 articles, so the window for this is small.
-- **Tags are swapped by id.** `POST /api/2/bookmarks/{id}/tags` takes
-  `add_tags` by name (creating a tag that doesn't exist yet) and `remove_tags`
-  by id only, in one request, and answers with the article's full tag list.
-  The mirror stores tag names, so when an old `samlingN` has to come off, sync
-  reads `GET /api/2/tags` once to find its id. Tagging leaves `time` alone, and
-  tags survive a re-save from the browser extension (both verified live).
-  There's no endpoint for deleting a tag, so an old `samlingN` nobody carries
-  any more lingers in the tag list until you remove it in the web app.
-- **No bulk actions.** Unlike Pocket, archiving is one request per article
-  (`POST /api/2/bookmarks/{id}/move`), so `sync` uses a small worker pool
-  (`--concurrency`, default 4) and saves progress as it goes.
-- **Errors are real HTTP statuses** with `{"error": {"code", "message"}}`.
-  samling retries 5xx, 429 (honouring `Retry-After`, capped at a minute), and
-  bodies that aren't JSON, which is how a maintenance page shows up.
-- **No word count** in the bookmark object. Reading-time filters would need a
-  `GET /api/2/bookmarks/{id}/parse` per article; not implemented.
-
 ## Development
 
 ```sh
@@ -360,6 +314,11 @@ deletions, re-saved keepers and their `samlingN` counters, picks archived
 elsewhere, migrating a v1 library, and the cursor advancing only after a
 successful sync. The link checker runs against a local test server and a fake
 resolver, never real article addresses.
+
+For deep API notes — two API versions, v1's 500-item limit, the `since` feed
+semantics, re-save bookmark-id reuse, offset paging caveats, tag swap
+mechanics, no bulk actions, error handling, missing word counts — see
+[DEVELOPING.md](DEVELOPING.md).
 
 ## Name
 
